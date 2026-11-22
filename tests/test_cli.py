@@ -1,0 +1,416 @@
+import io
+import json
+import os
+import time
+import unittest
+from contextlib import redirect_stdout
+from unittest import mock
+
+from cas import cli, launchd, planner, resets, statusline, usage
+from cas.config import Config
+from tests.helpers import IsolatedHome
+
+
+def run_cli(*argv):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main(list(argv))
+    return rc, buf.getvalue()
+
+
+class CliTest(IsolatedHome):
+    def add_profile(self, name="work", email="work@example.com", uuid="acct-work"):
+        rc, _ = run_cli("add", name, "--no-login")
+        self.assertEqual(rc, 0)
+        p = Config.load().get(name)
+        data = self.read_json(p.global_json)
+        data["oauthAccount"] = {"accountUuid": uuid, "emailAddress": email, "organizationType": "claude_max"}
+        self.write_json(p.global_json, data)
+        return p
+
+    def test_status_shows_whats_left_and_resets(self):
+        p = self.add_profile()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "statusline", usage.Window(95, now + 3600),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(20, now + 7200),
+                                                      usage.Window(10, now + 86400), "acct-work"))
+        resets.record("default", resets.parse_status({"eligible": True, "grants": [
+            {"id": "g1", "resets_left": 2, "clears": ["five_hour"], "type": "session"}]}, now))
+        rc, out = run_cli("status", "--no-live", "--plain")
+        self.assertEqual(rc, 0)
+        self.assertIn("5-HOUR LEFT", out)
+        self.assertIn("5%", out)       # default: 95% used -> 5% left
+        self.assertIn("80%", out)      # work
+        self.assertIn("Next up: work", out)
+        self.assertIn("limit reset available → cas reset default", out)
+
+        rc, out = run_cli("status", "--no-live", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["next"], "work")
+        self.assertEqual(data["profiles"][0]["limit_resets_left"], 2)
+
+    def test_pick_and_env(self):
+        self.add_profile()
+        rc, out = run_cli("pick")
+        self.assertEqual(rc, 0)
+        self.assertIn(out.strip(), {"default", "work"})
+        rc, out = run_cli("env", "work")
+        self.assertIn("CLAUDE_CONFIG_DIR=", out)
+        rc, out = run_cli("env", "default")
+        self.assertIn("unset CLAUDE_CONFIG_DIR", out)
+        rc, _ = run_cli("env", "nope")
+        self.assertEqual(rc, 1)
+
+    def test_statusline_records_usage_and_session(self):
+        p = self.add_profile()
+        cfg = Config.load()
+        payload = {"session_id": "sess-1", "workspace": {"current_dir": "/proj"},
+                   "rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": int(time.time()) + 3600},
+                                   "seven_day": {"used_percentage": 24, "resets_at": int(time.time()) + 86400}}}
+        out = statusline.main(json.dumps(payload), cfg, p.env({}))
+        self.assertIn("work", out)
+        self.assertIn("58% left", out)
+        st = usage.load_state("work")
+        self.assertEqual(st["last_session"]["id"], "sess-1")
+        self.assertEqual(st["usage"]["five_hour"]["pct"], 42)
+        # garbage input never raises
+        self.assertIn("default", statusline.main("not json", cfg, {}))
+
+    def test_statusline_suggests_handoff_at_limit(self):
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        payload = {"rate_limits": {"five_hour": {"used_percentage": 100, "resets_at": int(now) + 3600}}}
+        out = statusline.main(json.dumps(payload), cfg, {})
+        self.assertIn("cas handoff", out)
+
+    def test_latest_session_and_carry_flags(self):
+        cfg = Config.load()
+        d = self.hub / "projects" / cli.sanitize("/my/proj")
+        d.mkdir(parents=True)
+        (d / "old.jsonl").write_text("{}")
+        os.utime(d / "old.jsonl", (time.time() - 100, time.time() - 100))
+        (d / "new.jsonl").write_text("{}")
+        self.assertEqual(cli.latest_session(cfg, ["/my/proj"]), "new")
+        self.assertIsNone(cli.latest_session(cfg, ["/my/proj"], since=time.time() + 10))
+        args = ["--model", "opus", "fix it", "--add-dir", "a", "b", "-c", "--dangerously-skip-permissions",
+                "--resume", "x"]
+        self.assertEqual(cli.carry_flags(args),
+                         ["--model", "opus", "--add-dir", "a", "b", "--dangerously-skip-permissions"])
+
+    def test_transcript_limit_detection_ignores_conversation_text(self):
+        d = self.hub / "projects" / cli.sanitize("/p")
+        d.mkdir(parents=True)
+        lines = [
+            {"type": "user", "message": {"content": "what happens when I hit your session limit?"}},
+            {"type": "assistant", "isApiErrorMessage": True, "message": {"content": "You've hit your session limit"}},
+        ]
+        (d / "s.jsonl").write_text("\n".join(json.dumps(x) for x in lines[:1]))
+        self.assertFalse(cli.transcript_says_limit("s", ["/p"], 0))
+        (d / "s.jsonl").write_text("\n".join(json.dumps(x) for x in lines))
+        self.assertTrue(cli.transcript_says_limit("s", ["/p"], 0))
+
+    def test_session_from_args(self):
+        self.assertEqual(cli.session_from_args(["--model", "x"]), (None, False))
+        self.assertEqual(cli.session_from_args(["--resume", "abc"]), ("abc", True))
+        self.assertEqual(cli.session_from_args(["--session-id=u1"]), ("u1", True))
+        self.assertEqual(cli.session_from_args(["-c"]), (None, True))
+        self.assertEqual(cli.session_from_args(["--resume", "abc", "--fork-session"]), (None, True))
+
+    def test_handoff_picks_among_recent_conversations(self):
+        cfg = Config.load()
+        d = self.hub / "projects" / cli.sanitize("/p")
+        d.mkdir(parents=True)
+        for i, (sid, text) in enumerate([("old", "first task"), ("new", "second task")]):
+            (d / f"{sid}.jsonl").write_text(json.dumps({"type": "user", "message": {"content": text}}) + "\n")
+            os.utime(d / f"{sid}.jsonl", (time.time() - 600 + i * 300,) * 2)
+        style = cli.Style(False)
+        with mock.patch("sys.stdin.isatty", return_value=False), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.choose_session(cfg, ["/p"], style), "new")
+        self.assertIn("2 recent conversations", out.getvalue())
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="2"), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.choose_session(cfg, ["/p"], style), "old")
+        self.assertIn("first task", out.getvalue())
+
+    def test_handoff_moves_from_the_account_the_session_ran_on(self):
+        """Regression: the source account comes from the status line, not from the last `cas run`."""
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 3600),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(8, now + 7200),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        statusline.main(json.dumps({"session_id": "s-hub", "workspace": {"current_dir": "/p"}}), cfg, {})
+        statusline.main(json.dumps({"session_id": "s-work", "workspace": {"current_dir": "/q"}}), cfg,
+                        cfg.get("work").env({}))
+        statusline.main(json.dumps({"session_id": "s-work2", "workspace": {"current_dir": "/q"}}), cfg,
+                        cfg.get("work").env({}))
+        cli.set_global(last_profile="work")  # the misleading hint the old code used
+        self.assertEqual(cli.session_profile(cfg, "s-hub").name, "default")
+        self.assertEqual(cli.session_profile(cfg, "s-work").name, "work", "older sessions are remembered too")
+        args = cli.build_parser().parse_args(["handoff", "--session", "s-hub"])
+        with mock.patch.object(cli, "run_loop", return_value=0) as rl, redirect_stdout(io.StringIO()) as out:
+            cli.cmd_handoff(args)
+        self.assertEqual(rl.call_args[0][1], "work")
+        self.assertIn("handoff default → work", out.getvalue())
+        # no other account has room, but the source does: offer to stay, no false "limit reached"
+        args = cli.build_parser().parse_args(["handoff", "--session", "s-work"])
+        with mock.patch.object(cli, "run_loop", return_value=0) as rl, mock.patch.object(cli, "confirm",
+                                                                                          return_value=True), \
+                redirect_stdout(io.StringIO()) as out:
+            cli.cmd_handoff(args)
+        self.assertEqual(rl.call_args[0][1], "work")
+        self.assertIn("No other account has room", out.getvalue())
+        self.assertNotIn("reached its", out.getvalue())
+
+    def test_split_run_args(self):
+        self.add_profile()
+        cfg = Config.load()
+        self.assertEqual(cli.split_run_args(["-y", "work", "-c"], cfg), ({"mode": "auto"}, "work", ["-c"]))
+        self.assertEqual(cli.split_run_args(["fix the bug"], cfg)[1:], ("auto", ["fix the bug"]))
+        self.assertEqual(cli.split_run_args(["--", "work"], cfg)[1:], ("auto", ["work"]))
+
+    def test_decide_offers_reset_only_with_permission(self):
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 7200),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(99, now + 3600),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        resets.record("default", resets.parse_status({"eligible": True, "grants": [
+            {"id": "g1", "resets_left": 1, "clears": ["five_hour"], "type": "session"}]}, now))
+        rows = cli.gather(cfg, live=False)
+        style = cli.Style(False)
+        # non-interactive: never uses a reset on its own
+        with mock.patch("sys.stdin.isatty", return_value=False), redirect_stdout(io.StringIO()) as buf:
+            a = cli.decide(cfg, rows, style, cfg.hub(), "auto")
+        self.assertEqual(a.kind, "wait")
+        self.assertIn("/limit-reset", buf.getvalue())
+        self.assertIn("What's left", buf.getvalue())
+        # interactive: reset is recommended (no other account, 2h wait) and needs an explicit choice
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value=""), \
+                redirect_stdout(io.StringIO()) as buf:
+            a = cli.decide(cfg, rows, style, cfg.hub(), "ask")
+        self.assertEqual((a.kind, a.grant.id), ("reset", "g1"))
+        self.assertIn("(recommended)", buf.getvalue())
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="2"), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.decide(cfg, rows, style, cfg.hub(), "ask").kind, "wait")
+
+    def test_decide_unknown_resets_offers_a_check_but_recommends_waiting(self):
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 7200),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        resets.record("default", resets.parse_status({"eligible": False, "ineligible_reason": "surface"}, now))
+        rows = cli.gather(cfg, live=False)
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value=""), \
+                redirect_stdout(io.StringIO()) as buf:
+            a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
+        self.assertEqual(a.kind, "wait")
+        self.assertIn("check for a limit reset on default", buf.getvalue())
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="1"), \
+                redirect_stdout(io.StringIO()):
+            a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
+        self.assertEqual((a.kind, a.grant), ("reset", None))
+
+    def test_decide_prefers_free_switch_over_reset(self):
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 7200),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        resets.record("default", resets.parse_status({"eligible": True, "grants": [
+            {"id": "g1", "resets_left": 1, "clears": ["five_hour"]}]}, now))
+        rows = cli.gather(cfg, live=False)
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value=""), \
+                redirect_stdout(io.StringIO()):
+            a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
+        self.assertEqual((a.kind, a.profile.name), ("switch", "work"))
+
+    def fake_run(self, cfg, mode, answers=None):
+        """Run run_loop with a fake `claude` that hits the limit whenever it runs on 'default'."""
+        cfg.settings["prime_others_on_start"] = False  # never spawn real background pings from tests
+        proj = self.home / "proj"
+        proj.mkdir()
+        log = self.home / "calls.jsonl"
+        fake = self.home / "fake-claude"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys, pathlib, datetime\n"
+            "log = pathlib.Path(os.environ['FAKE_LOG'])\n"
+            "with log.open('a') as f: f.write(json.dumps({'args': sys.argv[1:], "
+            "'cfg': os.environ.get('CLAUDE_CONFIG_DIR'), 'profile': os.environ.get('CAS_PROFILE')}) + '\\n')\n"
+            "a = sys.argv[1:]\n"
+            "sid = a[a.index('--session-id') + 1] if '--session-id' in a else a[a.index('--resume') + 1]\n"
+            "if os.environ.get('CAS_PROFILE') == 'default':\n"
+            "    d = pathlib.Path(os.environ['FAKE_PROJECTS']); d.mkdir(parents=True, exist_ok=True)\n"
+            "    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()\n"
+            "    (d / (sid + '.jsonl')).write_text(json.dumps({'type': 'assistant', 'isApiErrorMessage': True, "
+            "'timestamp': ts, 'message': {'content': \"You've hit your session limit\"}}) + '\\n')\n"
+        )
+        fake.chmod(0o755)
+        cwd = os.getcwd()
+        os.environ.update(FAKE_LOG=str(log), PWD=str(proj),
+                          FAKE_PROJECTS=str(self.hub / "projects" / cli.sanitize(os.path.realpath(proj))))
+        answers = list(answers or [])
+        try:
+            os.chdir(proj)
+            with mock.patch.object(cli, "find_claude", return_value=str(fake)), \
+                    mock.patch("sys.stdin.isatty", return_value=bool(answers)), \
+                    mock.patch("builtins.input", side_effect=lambda *_: answers.pop(0)), \
+                    redirect_stdout(io.StringIO()) as out:
+                rc = cli.run_loop(cfg, "default", ["--model", "opus", "hello"], mode, cli.Style(False))
+        finally:
+            os.chdir(cwd)
+            for k in ("FAKE_LOG", "FAKE_PROJECTS"):
+                os.environ.pop(k, None)
+        self.assertEqual(rc, 0)
+        return [json.loads(x) for x in log.read_text().splitlines()], out
+
+    def test_run_loop_hands_conversation_to_next_account(self):
+        """End to end with a fake `claude`: account A hits its limit, the conversation resumes on B."""
+        self.add_profile()
+        cfg = Config.load()
+        cfg.settings["live_usage"] = "never"
+        calls, out = self.fake_run(cfg, "auto")
+        self.assertEqual(len(calls), 2, out.getvalue())
+        self.assertEqual((calls[0]["profile"], calls[0]["cfg"], calls[0]["args"][0], calls[0]["args"][2:]),
+                         ("default", None, "--session-id", ["--model", "opus", "hello"]))
+        sid = calls[0]["args"][1]
+        self.assertEqual(calls[1]["profile"], "work")
+        self.assertEqual(calls[1]["cfg"], str(cfg.get("work").config_dir))
+        self.assertEqual(calls[1]["args"], ["--model", "opus", "--resume", sid], "resumes exactly its own session")
+        self.assertIn("handoff: auto → work", out.getvalue())
+
+    def test_run_loop_reset_path_asks_and_offers_once(self):
+        """No other account has room: the user picks the reset; it opens /limit-reset; never offered twice."""
+        self.add_profile()
+        cfg = Config.load()
+        cfg.settings["live_usage"] = "never"
+        now = time.time()
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(99, now + 3600),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        resets.record("default", resets.parse_status({"eligible": True, "grants": [
+            {"id": "g1", "resets_left": 1, "clears": ["five_hour"], "type": "session"}]}, now))
+        calls, out = self.fake_run(cfg, "auto", answers=["", ""])  # Enter = recommended, twice
+        self.assertEqual(len(calls), 2, out.getvalue())
+        self.assertEqual(calls[1]["profile"], "default")
+        self.assertEqual(calls[1]["args"], ["--model", "opus", "--resume", calls[0]["args"][1], "/limit-reset 5-hour"])
+        text = out.getvalue()
+        self.assertIn("you confirm there", text)
+        self.assertEqual(text.count("use 5-hour reset on default"), 1, "reset offered only once per run")
+
+    def test_prime_others_only_pings_closed_windows_once(self):
+        self.add_profile()
+        rc, _ = run_cli("add", "third", "--no-login")
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(40, now + 3600),
+                                                         usage.Window(10, now + 86400), "acct-hub"))
+        with mock.patch("subprocess.Popen") as popen, redirect_stdout(io.StringIO()) as out:
+            started = cli.prime_others(cfg, cfg.get("work"), cli.Style(False), now)
+            # default has an open window, third isn't logged in, work is the target
+            self.assertEqual(started, [])
+            started = cli.prime_others(cfg, cfg.get("default"), cli.Style(False), now)
+            self.assertEqual(started, ["work"])
+            self.assertEqual(popen.call_args[0][0][-2:], ["ping", "work"])
+            self.assertTrue(popen.call_args[1]["start_new_session"])
+            self.assertEqual(cli.prime_others(cfg, cfg.get("default"), cli.Style(False), now + 60), [],
+                             "not spawned twice within 10 minutes")
+            cfg.settings["prime_others_on_start"] = False
+            self.assertEqual(cli.prime_others(cfg, cfg.get("default"), cli.Style(False), now + 3600), [])
+        self.assertIn("opening the 5-hour window of work", out.getvalue())
+
+    def test_rename_keeps_login_dir_state_and_schedule(self):
+        p = self.add_profile()
+        usage.update_state("work", last_ping={"ts": 1})
+        usage.update_state("default", last_ping={"ts": 2})
+        cli.set_global(last_profile="work")
+        entries = planner.calendar_entries([360], [1])
+        with mock.patch.object(launchd, "_launchctl", return_value=mock.Mock(returncode=0)), \
+                mock.patch.object(launchd, "supported", return_value=True):
+            launchd.install("work", entries, "/py", "/cas", "/bin")
+            rc, out = run_cli("rename", "work", "gmail.com")
+            self.assertEqual(rc, 0, out)
+            rc, out = run_cli("rename", "default", "example.com")
+            self.assertEqual(rc, 0, out)
+        cfg = Config.load()
+        self.assertEqual(list(cfg.profiles), ["example.com", "gmail.com"])
+        self.assertTrue(cfg.get("example.com").is_hub)
+        self.assertEqual(cfg.get("gmail.com").config_dir, p.config_dir, "dir unchanged, so the login survives")
+        self.assertEqual(cfg.get("gmail.com").email, "work@example.com")
+        self.assertEqual(usage.load_state("gmail.com")["last_ping"], {"ts": 1})
+        self.assertEqual(usage.load_state("example.com")["last_ping"], {"ts": 2})
+        self.assertEqual(cli.global_state()["last_profile"], "gmail.com")
+        self.assertEqual(list(launchd.installed()), ["gmail.com"])
+        with open(launchd.plist_path("gmail.com"), "rb") as f:
+            import plistlib
+            self.assertEqual(plistlib.load(f)["ProgramArguments"][3], "gmail.com")
+        self.assertEqual(cfg.current({}).name, "example.com")
+        self.assertEqual(cfg.current(cfg.get("gmail.com").env({})).name, "gmail.com")
+        # bad names are refused
+        self.assertEqual(run_cli("rename", "gmail.com", "bad..name")[0], 1)
+        self.assertEqual(run_cli("rename", "gmail.com", "auto")[0], 1)
+        self.assertEqual(run_cli("rename", "gmail.com", "example.com")[0], 1)
+        self.assertEqual(run_cli("add", "x.com.", "--no-login")[0], 1)
+
+    def test_plan_and_plist(self):
+        self.add_profile()
+        rc, out = run_cli("plan", "--start", "08:00", "--end", "18:00")
+        self.assertEqual(rc, 0)
+        self.assertIn("pings 05:00", out)
+        pl = planner.plan(["work"], 480, 1080)
+        plist = launchd.build_plist("work", planner.calendar_entries(pl["work"], [1, 2]), "/py", "/cas", "/bin")
+        self.assertEqual(plist["ProgramArguments"], ["/py", "/cas", "ping", "work", "--scheduled"])
+        self.assertIn({"Weekday": 1, "Hour": 5, "Minute": 0}, plist["StartCalendarInterval"])
+
+    def test_init_installs_statusline_and_keeps_previous_one(self):
+        self.write_json(self.hub / "settings.json", {"model": "opus", "statusLine": {"type": "command",
+                                                                                     "command": "my-line"}})
+        with mock.patch.object(cli, "find_claude", return_value="/bin/echo"):
+            rc, out = run_cli("init")
+        self.assertEqual(rc, 0)
+        st = self.read_json(self.hub / "settings.json")
+        self.assertTrue(st["statusLine"]["command"].endswith("bin/cas statusline"))
+        self.assertEqual(st["model"], "opus")
+        self.assertEqual(Config.load().settings["statusline_chain"], "my-line")
+        cmd = (self.hub / "commands" / "accounts.md").read_text()
+        self.assertIn("status --plain", cmd)
+        self.assertTrue((self.home / ".local" / "bin" / "cas").is_symlink())
+        rc, out = run_cli("uninstall")
+        self.assertEqual(self.read_json(self.hub / "settings.json")["statusLine"]["command"], "my-line")
+        self.assertFalse((self.hub / "commands" / "accounts.md").exists())
+
+    def test_ping_skips_open_window_and_records_new_one(self):
+        self.add_profile()
+        cfg = Config.load()
+        p = cfg.get("work")
+        now = time.time()
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(10, now + 7200),
+                                                      usage.Window(5, now + 86400), "acct-work"))
+        with redirect_stdout(io.StringIO()) as buf:
+            self.assertTrue(cli.do_ping(cfg, p, None, False, False))
+        self.assertIn("already open", buf.getvalue())
+
+        usage.save_state("work", {})
+        fake = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch.object(cli, "find_claude", return_value="/bin/claude"), \
+                mock.patch("subprocess.run", return_value=fake) as run, \
+                mock.patch.object(cli, "refresh", side_effect=lambda p, s, live=None: (usage.best_snapshot(p), None)), \
+                redirect_stdout(io.StringIO()):
+            self.assertTrue(cli.do_ping(cfg, p, None, False, False))
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:4], ["/bin/claude", "-p", cli.PING_PROMPT, "--model"])
+        self.assertEqual(run.call_args[1]["env"]["CLAUDE_CONFIG_DIR"], str(p.config_dir))
+        snap = usage.best_snapshot(p)
+        self.assertEqual(snap.source, "ping")
+        self.assertAlmostEqual(snap.five_hour.resets_at, time.time() + 5 * 3600, delta=60)
+
+
+if __name__ == "__main__":
+    unittest.main()
