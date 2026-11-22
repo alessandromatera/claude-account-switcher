@@ -181,16 +181,33 @@ def update_state(name: str, **kv: Any) -> Dict[str, Any]:
     return st
 
 
+RESET_DEBOUNCE_S = 600  # one reset can show up as several drops while readings settle
+
+
 def record_snapshot(name: str, snap: Snapshot) -> None:
     st = load_state(name)
     old = Snapshot.from_dict(st["usage"]) if isinstance(st.get("usage"), dict) else None
     if old is not None and old.fetched_at > snap.fetched_at:
         return
+    cleared = [float(w) for w in st.get("reset_windows") or []]
+    r = snap.five_hour.resets_at
+    if r is not None and r > snap.fetched_at and any(abs(r - w) < 120 for w in cleared):
+        # Still describes the window a reset cleared: a stale reading (the status line repeats
+        # Claude Code's last response headers until its next request). Recording it would flip
+        # usage back up and make the next fresh reading look like another reset.
+        return
     if snap.extra is None and old is not None and old.extra is not None:
         snap.extra = old.extra  # the status line doesn't carry credits; keep the last known
+    used = old is not None and reset_used(old, snap)
+    count_it = used and snap.fetched_at - float(st.get("last_reset_at") or 0) > RESET_DEBOUNCE_S
+    if used:
+        st["last_reset_at"] = snap.fetched_at
+        o5, n5 = old.five_hour.resets_at, snap.five_hour.resets_at
+        if o5 is not None and (n5 is None or abs(n5 - o5) >= 120):  # only when it tells old and new apart
+            st["reset_windows"] = (cleared + [o5])[-5:]
     st["usage"] = snap.to_dict()
     save_state(name, st)
-    if old is not None and reset_used(old, snap) and (snap.account_uuid or old.account_uuid):
+    if count_it and (snap.account_uuid or old.account_uuid):
         from . import resetlog  # the reset happened between these two readings
 
         resetlog.note_use(snap.account_uuid or old.account_uuid, old.fetched_at, snap.fetched_at)

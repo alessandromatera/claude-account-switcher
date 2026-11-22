@@ -145,6 +145,36 @@ class SourcesTest(IsolatedHome):
         resets.set_manual(hub, 0)
         self.assertEqual(resets.best_status(hub).count(), 0)
 
+    def test_one_reset_with_flip_flopping_readings_counts_once(self):
+        """Regression: right after a reset the status line kept repeating pre-reset numbers between
+        fresh live readings, and every old->new flip was counted as another reset (4 became 1)."""
+        hub = Config.load().hub()
+        resets.set_manual(hub, 4, "full")
+        t = time.time()
+        old_w, new_w, week = t + 5 * 3600, t + 6 * 3600, t + 4 * 86400
+
+        def rec(dt, src, pct5, r5, pct7):
+            usage.record_snapshot(hub.name, usage.Snapshot(t + dt, src, usage.Window(pct5, r5),
+                                                            usage.Window(pct7, week), "acct-hub"))
+        rec(10, "statusline", 56, old_w, 96)   # before the reset
+        rec(28, "live", 4, new_w, 1)            # reset
+        rec(39, "statusline", 56, old_w, 96)   # stale repeat
+        rec(40, "live", 4, new_w, 1)
+        rec(44, "statusline", 56, old_w, 96)   # stale repeat
+        rec(46, "live", 4, new_w, 1)
+        self.assertEqual(resets.best_status(hub).count(), 3)
+        self.assertEqual(usage.best_snapshot(hub).seven_day.pct, 1, "stale readings are not recorded")
+
+    def test_weekly_only_reset_with_same_window_counts_once(self):
+        hub = Config.load().hub()
+        resets.set_manual(hub, 2, "weekly")
+        t = time.time()
+        w5, week = t + 3 * 3600, t + 4 * 86400
+        for dt, pct7 in ((10, 97), (20, 3), (30, 97), (40, 3)):
+            usage.record_snapshot(hub.name, usage.Snapshot(t + dt, "live", usage.Window(20, w5),
+                                                            usage.Window(pct7, week), "acct-hub"))
+        self.assertEqual(resets.best_status(hub).count(), 1)
+
     def test_cache_from_other_account_is_ignored(self):
         data = self.read_json(self.hub_json)
         data["cachedUsageUtilization"] = dict(CLAUDE_CACHE, fetchedAtMs=1, accountUuid="someone-else")
