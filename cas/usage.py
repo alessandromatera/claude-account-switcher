@@ -188,8 +188,24 @@ def record_snapshot(name: str, snap: Snapshot) -> None:
         return
     if snap.extra is None and old is not None and old.extra is not None:
         snap.extra = old.extra  # the status line doesn't carry credits; keep the last known
+    if old is not None and reset_used(old, snap):
+        st.setdefault("resets_used", []).append(snap.fetched_at)
+        m = st.get("resets_manual")
+        if isinstance(m, dict):
+            m["left"] = max(0, int(m.get("left") or 0) - 1)
+            if not m["left"]:
+                st.pop("resets_manual")
     st["usage"] = snap.to_dict()
     save_state(name, st)
+
+
+def reset_used(old: Snapshot, new: Snapshot) -> bool:
+    """Usage fell sharply while its window was still open: a limit reset was used."""
+    for o, n in ((old.five_hour, new.five_hour), (old.seven_day, new.seven_day)):
+        still_open = o.resets_at is not None and o.resets_at - new.fetched_at > 600
+        if still_open and o.pct is not None and n.pct is not None and n.pct + 15 <= o.pct:
+            return True
+    return False
 
 
 def best_snapshot(profile: Profile) -> Optional[Snapshot]:

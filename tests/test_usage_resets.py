@@ -106,25 +106,44 @@ class SourcesTest(IsolatedHome):
         self.assertEqual(rs.summary(short=True), "yes")
 
     def test_surface_answer_is_unknown_not_none(self):
-        """Real answer seen from the server: ineligible because of the asking client, not the account."""
+        """Real answer from the server: it won't tell cas, which says nothing about the account."""
         hub = Config.load().hub()
         resets.record(hub.name, resets.parse_status({"eligible": False, "ineligible_reason": "surface"}))
-        rs = resets.best_status(hub)  # no feature flags cached: can't tell
+        rs = resets.best_status(hub)
         self.assertEqual((rs.summary(short=True), rs.count(), rs.maybe()), ("?", None, True))
-        self.assertIn("only with Claude Code", rs.summary())
+        self.assertIn("claude.ai", rs.summary())
 
         data = self.read_json(self.hub_json)
         data["cachedGrowthBookFeatures"] = {"tengu_starry_waterfall": {"enabled": True}}
         self.write_json(self.hub_json, data)
-        rs = resets.best_status(hub)  # flags cached, reset flag absent: not offered
-        self.assertEqual((rs.summary(), rs.count(), rs.maybe(), rs.has_any()),
-                         ("not offered to this account", 0, False, False))
+        rs = resets.best_status(hub)
+        # regression: the Claude Code flag being off does NOT mean "no resets" (claude.ai showed 4)
+        self.assertEqual((rs.summary(short=True), rs.count(), rs.maybe(), rs.via_claude_code), ("?", None, True, False))
 
         data["cachedGrowthBookFeatures"]["tengu_cedar_ember"] = {"enabled": True}
         self.write_json(self.hub_json, data)
-        rs = resets.best_status(hub)  # feature on, details hidden: worth checking in Claude Code
-        self.assertTrue(rs.maybe())
-        self.assertEqual(rs.summary(short=True), "?")
+        self.assertTrue(resets.best_status(hub).via_claude_code)
+
+    def test_manual_record_and_automatic_decrement(self):
+        hub = Config.load().hub()
+        now = time.time()
+        resets.set_manual(hub.name, 4, "full", now + 18 * 86400)
+        rs = resets.best_status(hub)
+        self.assertEqual(rs.count(), 4)
+        self.assertIn("4 full resets", rs.summary())
+        self.assertIn("as you recorded them", rs.summary())
+        # usage drops sharply while the window is still open: a reset was used
+        usage.record_snapshot(hub.name, usage.Snapshot(now - 60, "statusline", usage.Window(100, now + 7200),
+                                                        usage.Window(94, now + 86400), "acct-hub"))
+        usage.record_snapshot(hub.name, usage.Snapshot(now, "live", usage.Window(0, now + 5 * 3600),
+                                                        usage.Window(0, now + 7 * 86400), "acct-hub"))
+        self.assertEqual(resets.best_status(hub).count(), 3)
+        # a normal window rollover is not a reset
+        usage.record_snapshot(hub.name, usage.Snapshot(now + 6 * 3600, "live", usage.Window(2, now + 11 * 3600),
+                                                        usage.Window(1, now + 7 * 86400), "acct-hub"))
+        self.assertEqual(resets.best_status(hub).count(), 3)
+        resets.set_manual(hub.name, 0)
+        self.assertIsNone(resets.manual_status(hub.name))
 
     def test_cache_from_other_account_is_ignored(self):
         data = self.read_json(self.hub_json)

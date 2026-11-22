@@ -10,8 +10,12 @@ Sources:
           The server shares the details only with some clients: to cas it may answer
           "ineligible: surface", which means "not telling you", not "you have none".
   claude  `unusedLimitResetStatusCache` in the profile's .claude.json (only "holds a reset: yes/no")
-  flags   Claude Code's cached feature flags: without `tengu_cedar_ember` the account isn't
-          offered limit resets at all (and /limit-reset is not available).
+  flags   Claude Code's cached feature flags: `tengu_cedar_ember` says whether Claude Code's
+          /limit-reset command is available. It says nothing about whether the account holds
+          resets: claude.ai can show and use them even when the flag is off.
+  manual  what you told cas (`cas reset <profile> --set N`), after reading claude.ai's usage page.
+          When an account's usage suddenly drops before its reset time, a reset was used and the
+          count goes down by one.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ KIND_ARG = {"session": "5-hour", "weekly": "weekly", "full": "full"}
 WINDOW_NAMES = {"five_hour": "5-hour", "seven_day": "weekly", "seven_day_opus": "Opus weekly",
                 "seven_day_sonnet": "Sonnet weekly"}
 FEATURE_FLAG = "tengu_cedar_ember"
+WEB_USAGE_URL = "https://claude.ai/settings/usage"
 # Ineligibility reasons that describe the asking client, not the account.
 UNKNOWN_REASONS = {"surface", "cli_version", "mobile", "unavailable", "unknown"}
 
@@ -77,13 +82,16 @@ class ResetStatus:
         """False when the answer says nothing about the account (e.g. 'ineligible: surface')."""
         if self.source == "live" and self.eligible is False:
             return (self.ineligible_reason or "unknown") not in UNKNOWN_REASONS
-        if self.source == "flags":
-            return self.feature is False
-        return True
+        return self.source != "flags"
 
     def maybe(self, now: Optional[float] = None) -> bool:
-        """Resets may exist but cas can't see them: worth checking with /limit-reset in Claude Code."""
-        return self.feature is not False and not self.informative and self.has_any(now) is None
+        """Resets may exist but cas can't see them: worth checking (claude.ai or /limit-reset)."""
+        return not self.informative and self.has_any(now) is None
+
+    @property
+    def via_claude_code(self) -> bool:
+        """Use resets through Claude Code's /limit-reset (else through claude.ai's usage page)."""
+        return self.feature is True
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> Optional["ResetStatus"]:
@@ -99,10 +107,8 @@ class ResetStatus:
 
     def count(self, now: Optional[float] = None) -> Optional[int]:
         """Resets left; None when unknown or only the yes/no cache is known."""
-        if self.grants or (self.source == "live" and self.informative):
+        if self.grants or (self.source in ("live", "manual") and self.informative):
             return sum(g.left for g in self.usable(now))
-        if self.feature is False:
-            return 0
         return None
 
     def has_any(self, now: Optional[float] = None) -> Optional[bool]:
@@ -113,12 +119,7 @@ class ResetStatus:
 
     def summary(self, now: Optional[float] = None, short: bool = False) -> str:
         now = time.time() if now is None else now
-        if self.feature is False and not self.grants:
-            return "-" if short else "not offered to this account"
-        if self.source == "live" and self.eligible is False:
-            if not self.informative:
-                return "?" if short else ("unknown: the server shares reset details only with Claude Code "
-                                          "itself (`cas reset` opens /limit-reset there)")
+        if self.source == "live" and self.eligible is False and self.informative:
             return "-" if short else f"none (not offered: {self.ineligible_reason})"
         grants = self.usable(now)
         if grants:
@@ -127,7 +128,8 @@ class ResetStatus:
             for kind in sorted({g.kind for g in grants}):
                 n = sum(g.left for g in grants if g.kind == kind)
                 parts.append(f"{n} {KIND_NAMES.get(kind, kind)}" + ("s" if n > 1 else ""))
-            exp = f" · use by {_when(first.ends_at, now)}" if first.ends_at else ""
+            exp = (f" · use by {_when(first.ends_at, now)}" if first.ends_at else "") + \
+                (" (as you recorded them)" if self.source == "manual" else "")
             return (f"{sum(g.left for g in grants)}" + (f" ↦{_when(first.ends_at, now)}" if first.ends_at else "")) \
                 if short else ", ".join(parts) + exp
         if self.count(now) == 0:
@@ -136,7 +138,8 @@ class ResetStatus:
             return "yes" if short else "at least one (run `cas status --live` for details)"
         if self.holds_unused is False:
             return "0" if short else "none"
-        return "?" if short else "unknown"
+        return "?" if short else ("unknown to cas: see claude.ai → Settings → Usage, then record them "
+                                  "with `cas reset <profile> --set N`")
 
 
 def _when(ts: Optional[float], now: float) -> str:
@@ -235,6 +238,25 @@ def feature_enabled(profile: Profile) -> Optional[bool]:
     return False if seen_any else None
 
 
+def manual_status(name: str) -> Optional[ResetStatus]:
+    m = load_state(name).get("resets_manual")
+    if not isinstance(m, dict):
+        return None
+    left = int(m.get("left") or 0)
+    grants = [Grant(id="manual", kind=m.get("kind") or "full", left=left, ends_at=m.get("ends_at"),
+                    usable_now=True, requires_limit=False)] if left > 0 else []
+    return ResetStatus(fetched_at=float(m.get("set_at") or 0), source="manual", eligible=True, grants=grants)
+
+
+def set_manual(name: str, left: int, kind: str = "full", ends_at: Optional[float] = None) -> None:
+    st = load_state(name)
+    if left <= 0:
+        st.pop("resets_manual", None)
+    else:
+        st["resets_manual"] = {"left": left, "kind": kind, "ends_at": ends_at, "set_at": time.time()}
+    save_state(name, st)
+
+
 def record(name: str, status: ResetStatus) -> None:
     st = load_state(name)
     st["resets"] = status.to_dict()
@@ -252,16 +274,17 @@ def best_status(profile: Profile, now: Optional[float] = None) -> Optional[Reset
     c = from_claude_cache(profile)
     if c and (c.valid_until is None or c.valid_until > now):
         cands.append(c)
+    m = manual_status(profile.name)
+    if m:
+        cands.append(m)
     feature = feature_enabled(profile) if profile.logged_in() else None
     good = [s for s in cands if s.informative]
     if good:
         best = max(good, key=lambda s: s.fetched_at)
-    elif feature is False:
-        best = ResetStatus(fetched_at=now, source="flags", feature=False)
     elif cands:
         best = max(cands, key=lambda s: s.fetched_at)
-    elif feature:
-        best = ResetStatus(fetched_at=now, source="flags", feature=True)
+    elif feature is not None:
+        best = ResetStatus(fetched_at=now, source="flags", feature=feature)
     else:
         return None
     best.feature = feature if best.feature is None else best.feature

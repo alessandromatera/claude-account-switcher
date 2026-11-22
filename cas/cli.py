@@ -505,8 +505,8 @@ def print_status(cfg: Config, rows: List[Row], style: Style, now: float, mark_cu
             msg += style.dim(f" · may have a limit reset → cas reset {b.profile.name}")
         print(msg)
     if any(r.resets and r.resets.has_any(now) for r in rows):
-        print(style.dim("Limit resets are only used when you ask: `cas reset <profile>` opens Claude Code's "
-                        "/limit-reset and you confirm there."))
+        print(style.dim("Limit resets are only used when you ask: `cas reset <profile>` opens /limit-reset or "
+                        "claude.ai's usage page, and you confirm there."))
 
 
 # --------------------------------------------------------------------------- decisions at the limit
@@ -574,17 +574,20 @@ def decide(cfg: Config, rows: List[Row], style: Style, current: Optional[Profile
     if alt:
         verb = "continue this conversation on" if current else "start on"
         options.append((Action("switch", alt.profile), f"{verb} {alt.profile.name} ({alt.reason})"))
-    if reset_opt and reset_unsure:
-        r, _ = reset_opt
-        options.append((Action("reset", r.profile, None),
-                        f"check for a limit reset on {r.profile.name}: opens /limit-reset in Claude Code, which "
-                        "shows what you have and asks before using one"))
-    elif reset_opt:
+    if reset_opt:
         r, g = reset_opt
-        desc = g.name if g else "a limit reset"
-        extra = f", {g.left} left" + (f", use by {when(g.ends_at, now)}" if g.ends_at else "") if g else ""
-        options.append((Action("reset", r.profile, g),
-                        f"use {desc} on {r.profile.name}{extra}: opens Claude Code's /limit-reset, you confirm there"))
+        via_cc = bool(r.resets and r.resets.via_claude_code)
+        if reset_unsure:
+            label = f"check for a limit reset on {r.profile.name}: " + (
+                "opens /limit-reset in Claude Code, which shows what you have and asks before using one" if via_cc
+                else "opens claude.ai's usage page, where you see them and click Reset yourself")
+        else:
+            desc = g.name if g else "a limit reset"
+            extra = f", {g.left} left" + (f", use by {when(g.ends_at, now)}" if g.ends_at else "") if g else ""
+            label = f"use {desc} on {r.profile.name}{extra}: " + (
+                "opens Claude Code's /limit-reset, you confirm there" if via_cc
+                else "opens claude.ai's usage page, you click Reset there")
+        options.append((Action("reset", r.profile, g), label))
     if current:
         options.append((Action("wait"), "stop here and wait" + (f" for {when(wait_until, now)}" if wait_until else "")))
     else:
@@ -748,14 +751,35 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
         if action.kind == "reset" and action.profile:
             target = action.profile.name
             reset_offered.append(target)
+            rs_now = resets.best_status(action.profile)
+            if rs_now is not None and rs_now.via_claude_code:
+                claude_args = carry_flags(claude_args) + (["--resume", session] if session else [])
+                pending = resets.limit_reset_arg(action.grant)
+                print(style.dim("Opening /limit-reset in Claude Code. Nothing is used until you confirm there "
+                                "(if no dialog appears, type /limit-reset)."))
+            elif use_reset_on_web(action.profile, cfg.settings, style):
+                claude_args = carry_flags(claude_args) + (["--resume", session] if session else ["--continue"])
+            else:
+                return rc
             if target in limited:
                 limited.remove(target)  # it may have room again after the reset
-            claude_args = carry_flags(claude_args) + (["--resume", session] if session else [])
-            pending = resets.limit_reset_arg(action.grant)
-            print(style.dim("Opening /limit-reset in Claude Code. Nothing is used until you confirm there "
-                            "(if no dialog appears, type /limit-reset)."))
             continue
         return rc
+
+
+def use_reset_on_web(p: Profile, settings: Dict[str, Any], style: Style) -> bool:
+    """Resets that Claude Code can't use are used on claude.ai: open the page, the user clicks."""
+    print(f"Opening {resets.WEB_USAGE_URL}. Check it's signed in as {p.email or p.name}, then click "
+          "“Reset for free” on the limit reset you want.")
+    try:
+        subprocess.call(["open", resets.WEB_USAGE_URL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    if not confirm("Did you use the reset?", default=False):
+        print("Nothing used.")
+        return False
+    refresh(p, settings, live=True)  # a sharp drop in usage marks the reset as used
+    return True
 
 
 def split_run_args(argv: List[str], cfg: Config) -> Tuple[Dict[str, Any], str, List[str]]:
@@ -857,20 +881,37 @@ def cmd_reset(args: argparse.Namespace) -> int:
     else:
         last = global_state().get("last_profile")
         p = cfg.get(last) if last in cfg.profiles else cfg.hub()
+    if args.set is not None:
+        ends = None
+        if args.expires:
+            try:
+                fmt = "%Y-%m-%d %H:%M" if " " in args.expires.strip() else "%Y-%m-%d"
+                ends = time.mktime(time.strptime(args.expires.strip(), fmt))
+                ends += 0 if " " in args.expires.strip() else 86399  # a date means: until the end of that day
+            except ValueError:
+                return die("--expires takes YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
+        resets.set_manual(p.name, args.set, args.kind or "full", ends)
+        rs = resets.best_status(p, now)
+        print(f"{p.name}: limit resets → {rs.summary(now) if rs else 'none'}")
+        return 0
     snap, err = refresh(p, cfg.settings, live=True)
     row = Row(p, snap, effective(snap, now), resets.best_status(p, now), err)
     print(f"{style.bold(p.name)} ({p.display()})")
     print("  " + left_line(row, style, now))
     rs = row.resets
+    via_cc = bool(rs and rs.via_claude_code)
     if err:
         print(style.dim(f"  live data unavailable: {err}"))
-    if not rs or not (rs.has_any(now) or rs.maybe(now)):
-        print("No limit reset on this account: " + (rs.summary(now) if rs else "cas has no information") + ".")
+    unknown = rs is None or rs.maybe(now)
+    if not unknown and not rs.has_any(now):
+        print("No limit reset on this account: " + rs.summary(now) + ".")
         return 1
-    if rs.maybe(now):
-        print("  cas can't see this account's limit resets: the server shares them only with Claude Code itself. "
-              "/limit-reset shows what you have.")
-    grants = rs.usable(now)
+    if unknown:
+        print("  cas can't see this account's limit resets (the server doesn't share them with it). " + (
+            "/limit-reset in Claude Code shows them." if via_cc else
+            f"claude.ai → Settings → Usage shows them; record them with: cas reset {p.name} --set N "
+            "--expires YYYY-MM-DD"))
+    grants = rs.usable(now) if rs else []
     for g in grants:
         notes = []
         if g.clears:
@@ -882,12 +923,23 @@ def cmd_reset(args: argparse.Namespace) -> int:
         if g.unavailable_reason:
             notes.append(f"unavailable now: {g.unavailable_reason.replace('_', ' ')}")
         print(f"  ⟲ {g.left}× {g.name}" + (style.dim(" · " + " · ".join(notes)) if notes else ""))
-    if row.eff.five_pct is not None and row.eff.five_pct < float(cfg.settings.get("switch_threshold", 90)):
+    week_low = row.eff.week_pct is not None and row.eff.week_pct >= 85
+    if week_low:
+        print(style.warn(f"  Only {100 - row.eff.week_pct:.0f}% of the weekly limit is left "
+                         f"(until {when(row.eff.week_resets, now)}): a full or weekly reset clears that too."))
+    elif row.eff.five_pct is not None and row.eff.five_pct < float(cfg.settings.get("switch_threshold", 90)):
         print(style.warn(f"  This account still has {100 - row.eff.five_pct:.0f}% of its 5-hour window; "
                          "a reset is usually worth keeping for when you hit the limit."))
     others = picker.best([(r.profile, r.eff) for r in gather(cfg)], cfg.settings, exclude={p.name})
     if others:
         print(style.dim(f"  Alternative that costs nothing: {others.profile.name} ({others.reason})."))
+    if not via_cc:
+        if not confirm("Open claude.ai's usage page to use one? (you click Reset there)"):
+            print("Nothing used.")
+            return 0
+        if use_reset_on_web(p, cfg.settings, style) and args.cont:
+            return run_loop(cfg, p.name, ["--continue"], cfg.settings.get("handoff", "ask"), style)
+        return 0
     if not confirm("Open Claude Code's /limit-reset on this account? (you confirm the reset there)"):
         print("Nothing used.")
         return 0
@@ -1720,9 +1772,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("claude_args", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_handoff)
 
-    s = sub.add_parser("reset", help="use a limit reset, after showing what's left (you confirm in Claude Code)")
+    s = sub.add_parser("reset", help="use a limit reset after showing what's left, or record the ones you have")
     s.add_argument("profile", nargs="?")
-    s.add_argument("--kind", choices=["session", "weekly", "full"], help="preselect a reset kind")
+    s.add_argument("--kind", choices=["session", "weekly", "full"], help="reset kind (with --set, default full)")
+    s.add_argument("--set", type=int, metavar="N", help="record how many resets claude.ai shows (0 clears)")
+    s.add_argument("--expires", metavar="DATE", help="with --set: when the first one expires (YYYY-MM-DD [HH:MM])")
     s.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the last conversation here")
     s.set_defaults(fn=cmd_reset)
 

@@ -173,8 +173,14 @@ class CliTest(IsolatedHome):
         self.assertEqual(cli.split_run_args(["fix the bug"], cfg)[1:], ("auto", ["fix the bug"]))
         self.assertEqual(cli.split_run_args(["--", "work"], cfg)[1:], ("auto", ["work"]))
 
+    def enable_limit_reset_command(self):
+        data = self.read_json(self.hub_json)
+        data["cachedGrowthBookFeatures"] = {"tengu_cedar_ember": {"enabled": True}}
+        self.write_json(self.hub_json, data)
+
     def test_decide_offers_reset_only_with_permission(self):
         self.add_profile()
+        self.enable_limit_reset_command()
         cfg = Config.load()
         now = time.time()
         usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 7200),
@@ -290,6 +296,7 @@ class CliTest(IsolatedHome):
     def test_run_loop_reset_path_asks_and_offers_once(self):
         """No other account has room: the user picks the reset; it opens /limit-reset; never offered twice."""
         self.add_profile()
+        self.enable_limit_reset_command()
         cfg = Config.load()
         cfg.settings["live_usage"] = "never"
         now = time.time()
@@ -358,6 +365,35 @@ class CliTest(IsolatedHome):
         self.assertEqual(run_cli("rename", "gmail.com", "auto")[0], 1)
         self.assertEqual(run_cli("rename", "gmail.com", "example.com")[0], 1)
         self.assertEqual(run_cli("add", "x.com.", "--no-login")[0], 1)
+
+    def test_reset_on_claude_ai_when_claude_code_cant(self):
+        """No /limit-reset in Claude Code: cas opens claude.ai's usage page and resumes once the user is done."""
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(99, now + 3600),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        resets.set_manual("default", 4, "full", now + 86400 * 18)
+        real_call = cli.subprocess.call
+        opened = []
+
+        def fake_call(cmd, *a, **kw):
+            if cmd[0] == "open":
+                opened.append(cmd[1])
+                return 0
+            return real_call(cmd, *a, **kw)
+
+        with mock.patch.object(cli.subprocess, "call", side_effect=fake_call), \
+                mock.patch.object(cli, "confirm", return_value=True), \
+                mock.patch.object(cli, "refresh", side_effect=lambda p, s, live=None: (usage.best_snapshot(p), None)):
+            calls, out = self.fake_run(cfg, "auto", answers=["", ""])
+        self.assertEqual(opened, [resets.WEB_USAGE_URL])
+        self.assertIn("use full reset on default", out.getvalue())
+        self.assertIn("click Reset there", out.getvalue())
+        self.assertEqual(calls[1]["profile"], "default")
+        self.assertEqual(calls[1]["args"][-2], "--resume", "resumes the conversation, no /limit-reset")
+        rc, out = run_cli("reset", "work", "--set", "2", "--expires", "2026-12-10")
+        self.assertIn("2 full resets", out)
 
     def test_plan_and_plist(self):
         self.add_profile()
