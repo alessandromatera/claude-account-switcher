@@ -35,7 +35,7 @@ open the login URL in a private window.
 | `cas reset [name]` | Use a limit reset (see below) |
 | `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account |
 | `cas rename old new` | Rename a profile; its login is kept (names may contain dots, e.g. `gmail.com`) |
-| `cas share --store …` | Share memory with your other Macs through Dropbox (see below) |
+| `cas share --store …` | Share memory with your other machines through a synced folder (see below) |
 | `cas doctor` / `cas sync` | Check the setup / repair shared links and files |
 
 Plain `claude` keeps working: it runs on the `~/.claude` account, with the status line and
@@ -100,28 +100,44 @@ a JSON file it merges key by key; for `CLAUDE.md` the newer copy wins and the ot
 
 ## Sharing memory between machines
 
+`cas` doesn't move anything between machines itself. You give it a folder your machines already
+keep in sync (any sync client, or a share mounted on each of them), and it copies memory in and
+out of that folder.
+
 ```sh
-cas share --store ~/Dropbox/<your folder>/.claude-shared    # on each Mac, once
+cas share --store <a folder your machines keep in sync>    # on each machine, once
 cas share --status
+cas share --off
 ```
 
-Shared through that folder: the user `CLAUDE.md`, the auto-memory of every project under Dropbox,
-`agents/`, `commands/` and your skills. Not shared: `skills/synced`, which is Claude Code's own
-per-account sync of claude.ai skills.
+Shared through that folder: the user `CLAUDE.md`, the auto-memory of your projects, `agents/`,
+`commands/` and your skills. Not shared: `skills/synced`, which is Claude Code's own per-account
+sync of claude.ai skills.
 
-- **Project memory.** The same Dropbox project has a different path on each Mac
-  (`/Users/alice/Dropbox/X` vs `/Users/bob/Dropbox/X`). Claude Code keys memory by path, so
-  cas maps both to `memory/<path relative to Dropbox>`. Memory a project has on one Mac is waiting
-  on the other before you first open it there. Projects outside Dropbox stay local.
+- **Project memory.** Claude Code keys memory by the project's full path, and that path differs
+  between machines (`/Users/alice/code/X` vs `/Users/bob/code/X`). cas maps both to
+  `memory/<path relative to projects_root>`. By default `projects_root` is your home, so any
+  project at the same place under home on both machines shares its memory. The projects
+  themselves don't have to be synced. Use `--projects-root` to pick another folder. Projects
+  outside it stay local. Memory a project has on one machine is waiting on the other before you
+  first open it there.
 - **When it syncs.** Hooks sync at session start (everything) and after each reply (that
-  project's memory), plus on `cas sync`. Changes arrive as fast as Dropbox carries them.
-- **How.** Files are copied, not symlinked into Dropbox. The sync is three-way, so deletions
-  propagate. When both Macs changed a file: `MEMORY.md` indexes are merged line by line; for other
-  files the newer one is kept and the other becomes `<name>.conflict-<host>` (linked from
-  `MEMORY.md`). Nothing is dropped. The first `cas share` on each Mac writes a full backup to
-  `~/.claude-accounts/backups/`.
+  project's memory), plus on `cas sync`. Changes reach the other machine as fast as your folder
+  syncs; a session that's already open sees them at its next start.
+- **How.** Files are copied, not symlinked into the shared folder. The sync is three-way (this
+  machine, the shared folder, and the version from the last sync), so deletions propagate. When
+  both machines changed a file: `MEMORY.md` indexes are merged line by line; for other files the
+  newer one is kept and the other becomes `<name>.conflict-<host>` (linked from `MEMORY.md`).
+  Nothing is dropped.
+- **Safety.**
+  - The first `cas share` on each machine writes a full backup to `~/.claude-accounts/backups/`.
+  - If the shared folder changes, is emptied or is replaced, cas starts a fresh sync and re-shares
+    this machine's files instead of reading their absence as deletions.
+  - If most of a memory folder vanishes at once, cas doesn't delete those files here; it logs a
+    warning.
+  - Files a cloud client hasn't downloaded yet (`.icloud` placeholders) are skipped until they arrive.
 - **Not shared.** Logins, conversations (transcripts) and `settings.json`, which hold
-  machine-specific paths. Log in separately on each Mac; copying tokens between machines would
+  machine-specific paths. Log in separately on each machine; copying tokens between machines would
   make one log the other out when its token refreshes.
 
 ## Opening 5-hour windows ahead of time
@@ -187,7 +203,7 @@ one of these sources refreshes.
 | `prime_model` | `haiku` | model for window-opening pings |
 | `prime_others_on_start` | true | `cas run` opens the other accounts' windows in the background |
 | `shared_store` | none | folder shared with your other Macs (`cas share`) |
-| `dropbox_root` | `~/Dropbox` | projects under it share memory across Macs |
+| `projects_root` | `~` | projects at the same path relative to it share memory across machines |
 | `sync_mcp` | true | copy user-scope MCP servers from `~/.claude.json` into profiles |
 | `schedule` | 09:00–19:00 mon-fri stagger | written by `cas schedule apply` |
 

@@ -1196,10 +1196,10 @@ def cmd_share(args: argparse.Namespace) -> int:
     if args.status:
         store = shared.store_path(s)
         if not store:
-            print("Not sharing memory between machines. Turn it on with: cas share --store <folder in Dropbox>")
+            print("Not sharing memory between machines. Turn it on with: cas share --store <a folder your machines keep in sync>")
             return 0
         print(f"Shared folder: {store}")
-        print(f"Dropbox here:  {shared.dropbox_root(s)}")
+        print(f"Projects root: {shared.projects_root(s)}")
         print(f"Hooks:         {'installed' if share_hooks_installed() else 'missing (cas share)'}")
         for m in shared.machines(store):
             print(f"  {m.get('host')}: {m.get('home')} · last sync {age(time.time() - float(m.get('synced_at', 0)))}")
@@ -1209,15 +1209,15 @@ def cmd_share(args: argparse.Namespace) -> int:
 
     store_arg = args.store or s.get("shared_store")
     if not store_arg:
-        return die("say where: cas share --store ~/Dropbox/<your folder>/.claude-shared")
-    if args.dropbox_root:
-        s["dropbox_root"] = args.dropbox_root
-    root = shared.dropbox_root(s)
+        return die("say where: cas share --store <a folder your machines keep in sync>")
+    if args.projects_root:
+        s["projects_root"] = args.projects_root
+    root = shared.projects_root(s)
     store = Path(os.path.expanduser(store_arg))
     if not root.is_dir():
-        return die(f"{root} doesn't exist; pass --dropbox-root")
+        return die(f"{root} doesn't exist; pass --projects-root")
     if not store.parent.is_dir():
-        return die(f"{store.parent} doesn't exist (is Dropbox synced here?)")
+        return die(f"{store.parent} doesn't exist (is the shared folder synced to this machine?)")
     first = not shared.base_root().exists()
     if first:
         print(f"· backup of this machine's memory: {shared.backup(s)}")
@@ -1234,7 +1234,7 @@ def cmd_share(args: argparse.Namespace) -> int:
         print(f"  … {len(acts) - 20} more (all in {cas_home() / 'logs' / 'share.log'})")
     others = [m for m in shared.machines(store) if m.get("host") != shared.host()]
     print(f"Done: {len(acts)} change(s)." + ("" if others else " Run `cas share --store <same folder>` on the other "
-                                                               "machine once Dropbox has synced it."))
+                                                               "machine once the folder has synced there."))
     return 0
 
 
@@ -1740,9 +1740,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_sync)
 
-    s = sub.add_parser("share", help="share memory with your other machines through Dropbox")
-    s.add_argument("--store", help="shared folder, e.g. ~/Dropbox/<you>/.claude-shared")
-    s.add_argument("--dropbox-root", help="where Dropbox is on this machine (default ~/Dropbox)")
+    s = sub.add_parser("share", help="share memory with your other machines through a folder they keep in sync")
+    s.add_argument("--store", help="a folder your machines keep in sync")
+    s.add_argument("--projects-root", help="projects at the same path relative to this folder share memory (default ~)")
     s.add_argument("--no-hooks", action="store_true", help="don't sync automatically from Claude Code")
     s.add_argument("--status", action="store_true")
     s.add_argument("--off", action="store_true")

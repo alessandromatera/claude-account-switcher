@@ -65,8 +65,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "claude_bin": None,
     # Memory shared between machines through a synced folder (`cas share`). None = off.
     "shared_store": None,
-    # Where Dropbox lives on this machine: projects under it share memory across machines.
-    "dropbox_root": "~/Dropbox",
+    # Projects at the same path relative to this folder on each machine share memory (cas share).
+    "projects_root": "~",
     "schedule": {
         "start": "09:00",
         "end": "19:00",

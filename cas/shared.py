@@ -1,17 +1,17 @@
-"""Share memory between machines through a synced folder (Dropbox).
+"""Share memory between machines through a folder they keep in sync.
 
-The same Dropbox project has a different path on each Mac (/Users/alice/Dropbox/X vs
-/Users/bob/Dropbox/X), so Claude Code keeps its auto-memory under a different project key on
-each one. cas maps both to one place in the shared store, keyed by the path relative to Dropbox.
+The same project has a different path on each Mac (/Users/alice/code/X vs /Users/bob/code/X),
+so Claude Code keeps its auto-memory under a different project key on each one. cas maps both
+to one place in the shared store, keyed by the path relative to `projects_root` (default: home).
 
-Store layout (<store> is e.g. ~/Dropbox/me/.claude-shared):
+Store layout (<store> is a folder your machines keep in sync):
     user/CLAUDE.md                 user memory
-    memory/<project>/...           auto-memory of each Dropbox project ("Projects-X")
+    memory/<project>/...           auto-memory of each project ("code-X" for ~/code/X)
     agents/ commands/ skills/      your agents, commands and skills (not skills/synced: that one
                                    is Claude Code's own per-account sync of claude.ai skills)
-    skills-links.json              top-level skills that are symlinks into Dropbox
+    skills-links.json              top-level skills that are symlinks under projects_root
 
-Files are copied, never symlinked into Dropbox (Claude Code refuses some writes through symlinks).
+Files are copied, never symlinked into the shared folder (Claude Code refuses some writes through symlinks).
 Each file is synced three-way against the version seen at the last sync, so cas knows which side
 changed, and deletions propagate. Edited on both machines: MEMORY.md indexes are merged line by
 line; for other files the newer one wins and the older is kept as <name>.conflict-<host>.<ext>
@@ -35,7 +35,7 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from .config import cas_home, copy_atomic, home, hub_dir, read_json, write_json_atomic, write_text_atomic
 
-SKIP_NAMES = {".DS_Store", "Icon\r", ".dropbox", ".dropbox.attr"}
+SKIP_NAMES = {".DS_Store", "Icon\r", ".dropbox", ".dropbox.attr"}  # Finder and sync-client metadata
 SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv"}
 SKILLS_EXCLUDE = {"synced"}  # managed by Claude Code per account
 
@@ -110,9 +110,30 @@ def _union_lines(primary: str, other: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _placeholders(root: Path) -> bool:
+    """iCloud keeps evicted files as '.<name>.icloud': their content isn't here yet."""
+    if not root.is_dir():
+        return False
+    return any(f.startswith(".") and f.endswith(".icloud") for _, _, fs in os.walk(root) for f in fs)
+
+
+MASS_DELETE_MIN = 5  # deleting at least this many files...
+MASS_DELETE_SHARE = 0.5  # ...and more than this share of an area at once looks like a lost folder
+
+
 def sync_tree(local: Path, store: Path, base: Path, area: str, actions: List[str],
               memory: bool = False, exclude_top: Set[str] = frozenset()) -> None:
-    rels = _files(local, exclude_top) | _files(store, exclude_top) | _files(base, exclude_top)
+    if _placeholders(store):
+        actions.append(f"{area}: some shared files aren't downloaded yet (iCloud); skipped this time")
+        return
+    store_files, base_files = _files(store, exclude_top), _files(base, exclude_top)
+    rels = _files(local, exclude_top) | store_files | base_files
+    gone = [r for r in base_files - store_files if _sha(local / r) == _sha(base / r)]
+    protect = len(gone) >= MASS_DELETE_MIN and len(gone) > MASS_DELETE_SHARE * len(base_files)
+    if protect:
+        actions.append(f"{area}: {len(gone)} of {len(base_files)} files vanished from the shared folder at once; "
+                       "not deleting them here (if you really deleted them on the other machine, delete them "
+                       "here too)")
     pointers: List[str] = []
     for rel in sorted(rels):
         a, b, o = local / rel, store / rel, base / rel
@@ -120,6 +141,9 @@ def sync_tree(local: Path, store: Path, base: Path, area: str, actions: List[str
         if ha == hb:
             if ho != ha:
                 _put(a if ha else None, o, base)
+            continue
+        if ha == ho and hb is None and protect:  # looks like a lost folder, not a deletion: push it back
+            _put(a, b, store)
             continue
         if ha == ho:  # only the shared copy changed
             _put(b if hb else None, a, local)
@@ -188,8 +212,8 @@ def sync_file(local: Path, store: Path, base: Path, area: str, actions: List[str
 
 # --------------------------------------------------------------------------- areas
 
-def dropbox_root(settings: Dict) -> Path:
-    return Path(os.path.expanduser(settings.get("dropbox_root") or "~/Dropbox"))
+def projects_root(settings: Dict) -> Path:
+    return Path(os.path.expanduser(settings.get("projects_root") or "~"))
 
 
 def store_path(settings: Dict) -> Optional[Path]:
@@ -198,11 +222,11 @@ def store_path(settings: Dict) -> Optional[Path]:
 
 
 def project_memory_pairs(settings: Dict, store: Path, only_key: Optional[str] = None) -> List[Tuple[Path, Path, str]]:
-    """(local memory dir, store dir, label) for every Dropbox project known on either side.
+    """(local memory dir, store dir, label) for every project under projects_root known on either side.
 
     only_key: limit to one local project key (the folder name under ~/.claude/projects).
     """
-    prefix = sanitize(str(dropbox_root(settings)))
+    prefix = sanitize(str(projects_root(settings)))
     projects = hub_dir() / "projects"
     names: Set[str] = set()
     if projects.is_dir():
@@ -220,7 +244,7 @@ def project_memory_pairs(settings: Dict, store: Path, only_key: Optional[str] = 
 
 
 def sync_skill_links(store: Path, settings: Dict, actions: List[str]) -> None:
-    root = dropbox_root(settings)
+    root = projects_root(settings)
     root_real = Path(os.path.realpath(root))
     manifest_path = store / "skills-links.json"
     manifest = read_json(manifest_path, {}) or {}
@@ -242,6 +266,41 @@ def sync_skill_links(store: Path, settings: Dict, actions: List[str]) -> None:
             actions.append(f"skills/{name}: linked to {target}")
     if changed:
         write_json_atomic(manifest_path, manifest, 0o644)
+
+
+STORE_MARKER = "store.json"
+
+
+def check_store_identity(store: Path, actions: List[str]) -> None:
+    """Forget the sync base when the shared folder is new, emptied or replaced.
+
+    The base says what both sides looked like at the last sync. Compared against a different or
+    empty folder, every missing file would look deleted on the other machine and be deleted here.
+    Without a base, the next sync is a first sync again: nothing is deleted, everything re-shared.
+    """
+    base = base_root()
+    marker = read_json(store / STORE_MARKER, None)
+    store_id = marker.get("id") if isinstance(marker, dict) else None
+    known_id = read_json(base / ".store.json", {}) or {}
+    same_path = known_id.get("path") in (None, str(store))
+    store_has_files = store.is_dir() and any(p.name != STORE_MARKER for p in store.iterdir())
+    reset = False
+    if not same_path:
+        reset, why = True, "the shared folder changed"
+    elif store_id is None and not store_has_files and base.exists() and any(base.iterdir()):
+        reset, why = True, "the shared folder is empty"
+    elif store_id is not None and known_id.get("id") not in (None, store_id):
+        reset, why = True, "the shared folder was replaced"
+    if reset:
+        shutil.rmtree(base, ignore_errors=True)
+        actions.append(f"{why}: starting a fresh sync (nothing is deleted, this machine's files are re-shared)")
+    if store_id is None:
+        import uuid
+
+        store_id = uuid.uuid4().hex
+        write_json_atomic(store / STORE_MARKER, {"id": store_id, "created_by": host()}, 0o644)
+    base.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(base / ".store.json", {"id": store_id, "path": str(store)}, 0o600)
 
 
 @contextmanager
@@ -270,6 +329,7 @@ def sync(settings: Dict, quick: bool = False, only_key: Optional[str] = None, wa
         if not got:
             return ["another sync is running; skipped"]
         store.mkdir(parents=True, exist_ok=True)
+        check_store_identity(store, actions)
         base = base_root()
         sync_file(hub_dir() / "CLAUDE.md", store / "user" / "CLAUDE.md", base / "user" / "CLAUDE.md",
                   "CLAUDE.md", actions)
