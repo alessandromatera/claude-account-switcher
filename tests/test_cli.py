@@ -422,6 +422,71 @@ class CliTest(IsolatedHome):
         self.assertEqual(self.read_json(self.hub / "settings.json")["statusLine"]["command"], "my-line")
         self.assertFalse((self.hub / "commands" / "accounts.md").exists())
 
+    def fake_exec(self, *argv, env=None):
+        """Run `cas claude ARGV`; returns (args claude got, CLAUDE_CONFIG_DIR, CAS_PROFILE)."""
+        got = {}
+
+        def execve(path, args, e):
+            got.update(args=args[1:], cfg=e.get("CLAUDE_CONFIG_DIR"), profile=e.get("CAS_PROFILE"))
+            raise SystemExit(0)
+
+        with mock.patch.dict(os.environ, env or {}), mock.patch.object(cli, "find_claude", return_value="/bin/claude"), \
+                mock.patch.object(cli.os, "execve", side_effect=execve):
+            with self.assertRaises(SystemExit):
+                run_cli("claude", *argv)
+        return got["args"], got["cfg"], got["profile"]
+
+    def test_fresh_claude_starts_on_the_current_account(self):
+        p = self.add_profile()
+        # nothing run through cas yet: the hub, as before
+        self.assertEqual(self.fake_exec("hi"), (["hi"], None, "default"))
+        cli.set_global(last_profile="work")
+        self.assertEqual(self.fake_exec("-c"), (["-c"], str(p.config_dir), "work"))
+        self.assertTrue((p.dir / "projects").is_symlink(), "the profile is prepared like `cas run` does")
+        rc, out = run_cli("env")
+        self.assertIn(f"CLAUDE_CONFIG_DIR={p.config_dir}", out)
+        self.assertEqual(json.loads(run_cli("status", "--no-live", "--json")[1])["current"], "work")
+        # a profile's default model applies to sessions, not to subcommands
+        run_cli("set", "work", "--model", "sonnet")
+        self.assertEqual(self.fake_exec("hi")[0], ["--model", "sonnet", "hi"])
+        self.assertEqual(self.fake_exec("agents"), (["agents"], str(p.config_dir), "work"))
+        # setup cas spreads from ~/.claude stays there
+        self.assertEqual(self.fake_exec("mcp", "add", "x"), (["mcp", "add", "x"], None, None))
+        # an account picked already (cas env, or a nested claude inside a session) is kept
+        self.assertEqual(self.fake_exec("hi", env={"CAS_PROFILE": "default"}), (["hi"], None, "default"))
+        self.assertEqual(self.fake_exec("-p", "x", env={"CLAUDECODE": "1"})[1:], (None, None))
+        # the current account disabled or gone: back to the hub
+        run_cli("set", "work", "--disable")
+        self.assertEqual(self.fake_exec("hi")[1:], (None, "default"))
+
+    def test_shell_hook_install_update_and_remove(self):
+        zshrc = self.home / ".zshrc"
+        zshrc.write_text("export A=1\n")
+        with mock.patch.object(cli, "find_claude", return_value="/bin/echo"):
+            rc, out = run_cli("init")
+        self.assertEqual(rc, 0)
+        text = zshrc.read_text()
+        self.assertTrue(text.startswith("export A=1\n\n" + cli.SHELL_BEGIN))
+        self.assertIn('command cas claude "$@"', text)
+        self.assertTrue(cli.shell_hook_installed())
+        # idempotent, and an outdated block is replaced in place
+        zshrc.write_text(text.replace("command cas claude", "old") + "export B=2\n")
+        cli.install_shell_hook()
+        cli.install_shell_hook()
+        self.assertEqual(zshrc.read_text(), text + "export B=2\n")
+        # a dotfiles symlink keeps pointing at its target
+        real = self.home / "dotfiles" / "bashrc"
+        real.parent.mkdir()
+        real.write_text("x\n")
+        os.symlink(real, self.home / ".bashrc")
+        cli.install_shell_hook()
+        self.assertTrue((self.home / ".bashrc").is_symlink())
+        self.assertIn(cli.SHELL_BEGIN, real.read_text())
+        run_cli("uninstall")
+        self.assertEqual(zshrc.read_text(), "export A=1\nexport B=2\n")
+        self.assertEqual(real.read_text(), "x\n")
+        self.assertFalse(cli.shell_hook_installed())
+
     def test_ping_skips_open_window_and_records_new_one(self):
         self.add_profile()
         cfg = Config.load()

@@ -507,6 +507,9 @@ def print_status(cfg: Config, rows: List[Row], style: Style, now: float, mark_cu
     if any(r.resets and r.resets.has_any(now) for r in rows):
         print(style.dim("Limit resets are only used when you ask: `cas reset <profile>` opens /limit-reset or "
                         "claude.ai's usage page, and you confirm there."))
+    if shell_hook_installed():
+        print(style.dim(f"A fresh `claude` starts on {active_profile(cfg).name}, the account cas last used "
+                        "(`cas run` picks the best one)."))
 
 
 # --------------------------------------------------------------------------- decisions at the limit
@@ -833,6 +836,59 @@ def cmd_run(argv: List[str]) -> int:
         return die(str(e))
 
 
+# --------------------------------------------------------------------------- plain `claude`
+
+# `claude` subcommands that manage what cas spreads from ~/.claude to every profile (MCP servers,
+# plugins) or the install itself: they keep running on ~/.claude.
+HUB_SUBCOMMANDS = {"mcp", "plugin", "plugins", "install", "update", "upgrade", "doctor"}
+
+
+def active_profile(cfg: Config) -> Profile:
+    """The account a fresh session starts on: the one cas last started or handed off to."""
+    last = global_state().get("last_profile")
+    p = cfg.profiles.get(last) if isinstance(last, str) else None
+    if p is None or not p.enabled or not p.logged_in():
+        return cfg.hub()
+    return p
+
+
+def cmd_claude(argv: List[str]) -> int:
+    """Plain `claude`, through the shell function `cas init` installs: start on the current account.
+
+    No handoff loop and no background pings (that's `cas run`): the profile is prepared the same
+    way, then claude replaces this process. An account chosen already (CLAUDE_CONFIG_DIR or
+    CAS_PROFILE set, e.g. by `cas env` or inside a session) is kept.
+    """
+    cfg = Config.load()
+    claude = find_claude(cfg)
+    args = list(argv)
+    env = dict(os.environ)
+    sub = args[0] if args and args[0] in CLAUDE_SUBCOMMANDS else None
+    chosen = env.get("CLAUDE_CONFIG_DIR") or env.get("CAS_PROFILE") or in_claude_code()
+    if not chosen and sub not in HUB_SUBCOMMANDS:
+        talk = sub is None and sys.stdin.isatty() and sys.stderr.isatty() \
+            and not (has_flag(args, "-p") or has_flag(args, "--print"))
+        style = Style(talk and not os.environ.get("NO_COLOR"))
+        p = active_profile(cfg)
+        try:
+            for a in prof.prepare(p, cfg.profile_list(), cfg.settings.get("sync_mcp", True)):
+                if talk:
+                    print(style.dim(f"· {a}"), file=sys.stderr)
+        except Exception as e:  # a failed sync must never stop claude from starting
+            if talk:
+                print(style.dim(f"· sync failed: {e}"), file=sys.stderr)
+        if p.model and sub is None and not has_flag(args, "--model"):
+            args = ["--model", p.model] + args
+        env = p.env(env)
+        if talk:
+            print(style.dim(f"→ Claude Code on {p.name} ({p.display()})"), file=sys.stderr)
+    try:
+        os.execve(claude, [claude, *args], env)
+    except OSError as e:
+        return die(f"could not start {claude}: {e}")
+    return 0  # unreachable: execve only returns by raising
+
+
 def cmd_handoff(args: argparse.Namespace) -> int:
     cfg = Config.load()
     style = make_style()
@@ -977,7 +1033,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "error": r.error,
             })
         c = picker.best([(r.profile, r.eff) for r in rows], cfg.settings)
-        print(json.dumps({"profiles": out, "next": c.profile.name if c else None}, indent=2))
+        print(json.dumps({"profiles": out, "next": c.profile.name if c else None,
+                          "current": active_profile(cfg).name}, indent=2))
         return 0
     style = make_style(args.plain)
     print_status(cfg, rows, style, now, mark_current=in_claude_code() or bool(os.environ.get("CAS_PROFILE")))
@@ -996,7 +1053,7 @@ def cmd_pick(args: argparse.Namespace) -> int:
 
 def cmd_env(args: argparse.Namespace) -> int:
     cfg = Config.load()
-    p = cfg.get(args.profile)
+    p = cfg.get(args.profile) if args.profile else active_profile(cfg)
     if p.config_dir is None:
         print("unset CLAUDE_CONFIG_DIR")
     else:
@@ -1565,6 +1622,71 @@ def link_cli() -> str:
     return f"linked {link}" + ("" if on_path else f" (add {bindir} to your PATH)")
 
 
+SHELL_BEGIN = "# >>> claude-account-switcher >>>"
+SHELL_END = "# <<< claude-account-switcher <<<"
+SHELL_BLOCK = (
+    SHELL_BEGIN + "\n"
+    "# Plain `claude` starts on the account cas is using now (`cas uninstall` removes this).\n"
+    'function claude { if command -v cas >/dev/null 2>&1; then command cas claude "$@"; '
+    'else command claude "$@"; fi; }\n'
+    + SHELL_END + "\n"
+)
+_SHELL_RE = re.escape(SHELL_BEGIN) + r".*?" + re.escape(SHELL_END) + r"\n?"
+SHELL_BLOCK_RE = re.compile(_SHELL_RE, re.S)
+SHELL_BLOCK_REMOVE_RE = re.compile(r"(?:(?<=\n)\n)?" + _SHELL_RE, re.S)  # plus the blank line we added
+
+
+def shell_rc_files(existing_only: bool = False) -> List[Path]:
+    rcs = [f for f in (home() / ".zshrc", home() / ".bashrc") if f.exists() or f.is_symlink()]
+    if rcs or existing_only:
+        return rcs
+    return [home() / (".bashrc" if os.path.basename(os.environ.get("SHELL", "")) == "bash" else ".zshrc")]
+
+
+def _read_rc(rc: Path) -> Optional[str]:
+    try:
+        return rc.read_text(encoding="utf-8") if rc.exists() else ""
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def shell_hook_installed() -> bool:
+    return any(SHELL_BEGIN in (_read_rc(rc) or "") for rc in shell_rc_files(existing_only=True))
+
+
+def install_shell_hook() -> str:
+    """Make plain `claude` start on the current account: a shell function in ~/.zshrc / ~/.bashrc."""
+    out = []
+    for rc in shell_rc_files():
+        real = Path(os.path.realpath(rc))  # keep a dotfiles symlink pointing where it did
+        text = _read_rc(real)
+        if text is None:
+            out.append(f"skipped {rc}: unreadable")
+            continue
+        if SHELL_BLOCK_RE.search(text):
+            new = SHELL_BLOCK_RE.sub(lambda _m: SHELL_BLOCK, text, count=1)
+        else:
+            new = text + ("" if not text else ("\n" if text.endswith("\n") else "\n\n")) + SHELL_BLOCK
+        if new == text:
+            out.append(f"{rc.name} already set")
+            continue
+        write_text_atomic(real, new, None if real.exists() else 0o644)
+        out.append(f"added to {rc}")
+    return "plain `claude` starts on the current account: " + ", ".join(out) + \
+        " (takes effect in new terminals, or after `source` in this one)"
+
+
+def remove_shell_hook() -> List[str]:
+    out = []
+    for rc in shell_rc_files(existing_only=True):
+        real = Path(os.path.realpath(rc))
+        text = _read_rc(real)
+        if text and SHELL_BEGIN in text:
+            write_text_atomic(real, SHELL_BLOCK_REMOVE_RE.sub("", text, count=1))
+            out.append(f"shell function removed from {rc}")
+    return out
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     cfg = Config.load()
     if args.name and args.name.lower() != cfg.hub().name:
@@ -1579,6 +1701,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         steps.append(install_statusline(cfg))
     if not args.no_commands:
         steps.append(install_command())
+    if not args.no_shell:
+        steps.append(install_shell_hook())
     cfg.save()
     for s in steps:
         print(f"· {s}")
@@ -1619,6 +1743,8 @@ def uninstall(args: argparse.Namespace) -> int:
     if launchd.supported():
         for n in launchd.remove_all():
             print(f"· schedule removed: {n}")
+    for s in remove_shell_hook():
+        print(f"· {s} (plain `claude` is back on ~/.claude in new terminals)")
     link = home() / ".local" / "bin" / "cas"
     if link.is_symlink() and Path(os.path.realpath(link)) == SCRIPT:
         link.unlink()
@@ -1661,6 +1787,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     slc = st.get("statusLine") if isinstance(st, dict) else None
     sl = slc.get("command", "") if isinstance(slc, dict) else ""
     print(f"{ok if 'bin/cas' in sl else bad} status line: {'installed' if 'bin/cas' in sl else 'not installed (cas init)'}")
+    if shell_hook_installed():
+        print(f"{ok} plain claude: starts on the current account, now {active_profile(cfg).name}")
+    else:
+        print(f"{bad} plain claude: always on ~/.claude ({cfg.hub().name}); `cas init` makes it follow the "
+              "current account")
     seen: Dict[str, str] = {}
     for p in cfg.profile_list():
         label = f"profile {p.name} ({p.dir})"
@@ -1724,6 +1855,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", help="name for the existing ~/.claude account (default: default)")
     s.add_argument("--no-statusline", action="store_true")
     s.add_argument("--no-commands", action="store_true")
+    s.add_argument("--no-shell", action="store_true", help="leave plain `claude` on ~/.claude (no shell function)")
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("add", help="create a profile for another account and log in")
@@ -1787,8 +1919,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--exclude", action="append")
     s.set_defaults(fn=cmd_pick)
 
+    sub.add_parser("claude", help="start Claude Code on the current account (what plain `claude` runs after init)")
+
     s = sub.add_parser("env", help="print shell exports to use a profile with plain `claude`")
-    s.add_argument("profile")
+    s.add_argument("profile", nargs="?", help="default: the current account")
     s.set_defaults(fn=cmd_env)
 
     s = sub.add_parser("sync", help="repair shared links, sync settings/CLAUDE.md/MCP servers and machine memory")
@@ -1846,6 +1980,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "run":
         return cmd_run(argv[1:])
+    if argv and argv[0] == "claude":
+        return cmd_claude(argv[1:])
     ap = build_parser()
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):

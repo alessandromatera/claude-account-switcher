@@ -16,7 +16,8 @@ against Claude Code 2.1.330.
 ```sh
 git clone https://github.com/alessandromatera/claude-account-switcher.git
 cd claude-account-switcher
-./bin/cas init            # links `cas` into ~/.local/bin, installs the status line and /accounts
+./bin/cas init            # links `cas` into ~/.local/bin, installs the status line, /accounts and the
+                          # `claude` shell function (fresh sessions start on the current account)
 cas add work              # new profile; a browser login opens: sign in with the *other* account
 cas status
 ```
@@ -33,14 +34,21 @@ open the login URL in a private window.
 | `cas run` | Start Claude Code on the best account (`cas run work` picks one). Other arguments go to `claude` unchanged: `cas run -c`, `cas run work --model opus` |
 | `cas handoff [name]` | Resume this directory's last conversation on another account |
 | `cas reset [name]` | Use a limit reset (see below) |
-| `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account |
+| `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account; `cas env` alone gives the current account |
 | `cas rename old new` | Rename a profile; its login is kept (names may contain dots, e.g. `gmail.com`) |
 | `cas share --store …` | Share memory with your other machines through a synced folder (see below) |
 | `cas doctor` / `cas sync` | Check the setup / repair shared links and files |
 
-Plain `claude` keeps working: it runs on the `~/.claude` account, with the status line and
-`/accounts`. Picking the account and switching it at the limit only happen through `cas run`,
-because a running Claude Code session can't change account.
+**Plain `claude`** starts on the current account: the one cas last started or handed off to
+(`cas status` names it). For that, `cas init` adds a small `claude` shell function to `~/.zshrc`
+(and `~/.bashrc` if you have one), which runs `cas claude`; `cas init --no-shell` leaves plain
+`claude` on `~/.claude`. It prepares the profile like `cas run` does, but it doesn't pick the best
+account or offer a handoff at the limit: that needs `cas run`, because a running Claude Code
+session can't change account. Exceptions:
+- Setup commands (`claude mcp`, `claude plugin`, `claude update`, `claude install`, `claude doctor`)
+  keep running on `~/.claude`, which cas spreads to every profile.
+- An account you already chose is kept: a shell with `cas env` applied, or a `claude` started inside
+  a session.
 
 **Inside Claude Code:**
 - The status line shows the current account, what's left and when it resets, plus the next account:
@@ -228,8 +236,8 @@ Per profile: `cas set work --label "Work Max" --model sonnet --disable`.
   sources, and `cas doctor` shows what broke.
 - Each account logs in normally from this machine; `cas` doesn't hide or spoof anything. Check that
   the way you use several subscriptions fits Anthropic's terms for your plans.
-- `cas uninstall` removes the status line, `/accounts`, the schedules and the `cas` link. Profiles
-  stay; `cas remove <name> --purge` logs one out and deletes it.
+- `cas uninstall` removes the status line, `/accounts`, the schedules, the `claude` shell function and
+  the `cas` link. Profiles stay; `cas remove <name> --purge` logs one out and deletes it.
 
 ## Development
 
