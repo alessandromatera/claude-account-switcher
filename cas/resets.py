@@ -24,6 +24,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import resetlog
 from .config import Profile, read_json
 from .usage import load_state, parse_time, save_state
 
@@ -238,23 +239,21 @@ def feature_enabled(profile: Profile) -> Optional[bool]:
     return False if seen_any else None
 
 
-def manual_status(name: str) -> Optional[ResetStatus]:
-    m = load_state(name).get("resets_manual")
-    if not isinstance(m, dict):
+def manual_status(profile: Profile) -> Optional[ResetStatus]:
+    """What you recorded (on any machine, when sharing is on), minus the resets seen used since."""
+    m = resetlog.merged(profile.account_uuid)
+    if not m:
         return None
-    left = int(m.get("left") or 0)
+    left = int(m["left"])
     grants = [Grant(id="manual", kind=m.get("kind") or "full", left=left, ends_at=m.get("ends_at"),
                     usable_now=True, requires_limit=False)] if left > 0 else []
     return ResetStatus(fetched_at=float(m.get("set_at") or 0), source="manual", eligible=True, grants=grants)
 
 
-def set_manual(name: str, left: int, kind: str = "full", ends_at: Optional[float] = None) -> None:
-    st = load_state(name)
-    if left <= 0:
-        st.pop("resets_manual", None)
-    else:
-        st["resets_manual"] = {"left": left, "kind": kind, "ends_at": ends_at, "set_at": time.time()}
-    save_state(name, st)
+def set_manual(profile: Profile, left: int, kind: str = "full", ends_at: Optional[float] = None) -> None:
+    if not profile.account_uuid:
+        raise ValueError(f"{profile.name} is not logged in")
+    resetlog.set_count(profile.account_uuid, left, kind, ends_at)
 
 
 def record(name: str, status: ResetStatus) -> None:
@@ -274,7 +273,7 @@ def best_status(profile: Profile, now: Optional[float] = None) -> Optional[Reset
     c = from_claude_cache(profile)
     if c and (c.valid_until is None or c.valid_until > now):
         cands.append(c)
-    m = manual_status(profile.name)
+    m = manual_status(profile)
     if m:
         cands.append(m)
     feature = feature_enabled(profile) if profile.logged_in() else None

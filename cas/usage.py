@@ -188,15 +188,12 @@ def record_snapshot(name: str, snap: Snapshot) -> None:
         return
     if snap.extra is None and old is not None and old.extra is not None:
         snap.extra = old.extra  # the status line doesn't carry credits; keep the last known
-    if old is not None and reset_used(old, snap):
-        st.setdefault("resets_used", []).append(snap.fetched_at)
-        m = st.get("resets_manual")
-        if isinstance(m, dict):
-            m["left"] = max(0, int(m.get("left") or 0) - 1)
-            if not m["left"]:
-                st.pop("resets_manual")
     st["usage"] = snap.to_dict()
     save_state(name, st)
+    if old is not None and reset_used(old, snap) and (snap.account_uuid or old.account_uuid):
+        from . import resetlog  # the reset happened between these two readings
+
+        resetlog.note_use(snap.account_uuid or old.account_uuid, old.fetched_at, snap.fetched_at)
 
 
 def reset_used(old: Snapshot, new: Snapshot) -> bool:

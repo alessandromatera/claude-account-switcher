@@ -890,7 +890,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
                 ends += 0 if " " in args.expires.strip() else 86399  # a date means: until the end of that day
             except ValueError:
                 return die("--expires takes YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
-        resets.set_manual(p.name, args.set, args.kind or "full", ends)
+        try:
+            resets.set_manual(p, args.set, args.kind or "full", ends)
+        except ValueError as e:
+            return die(str(e))
         rs = resets.best_status(p, now)
         print(f"{p.name}: limit resets → {rs.summary(now) if rs else 'none'}")
         return 0

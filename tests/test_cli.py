@@ -373,7 +373,7 @@ class CliTest(IsolatedHome):
         now = time.time()
         usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(99, now + 3600),
                                                       usage.Window(30, now + 86400), "acct-work"))
-        resets.set_manual("default", 4, "full", now + 86400 * 18)
+        resets.set_manual(cfg.hub(), 4, "full", now + 86400 * 18)
         real_call = cli.subprocess.call
         opened = []
 

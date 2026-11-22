@@ -341,6 +341,9 @@ def sync(settings: Dict, quick: bool = False, only_key: Optional[str] = None, wa
             sync_tree(hub_dir() / "skills", store / "skills", base / "skills", "skills", actions,
                       exclude_top=SKILLS_EXCLUDE)
             sync_skill_links(store, settings, actions)
+        from . import resetlog  # recorded limit resets travel with the shared folder too
+
+        resetlog.publish()
         write_json_atomic(store / "machines" / f"{host()}.json",
                           {"host": host(), "home": str(home()), "synced_at": time.time()}, 0o644)
     return actions

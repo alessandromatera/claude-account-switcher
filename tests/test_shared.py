@@ -143,6 +143,31 @@ class TwoMachines(unittest.TestCase):
     def test_projects_root_defaults_to_home(self):
         self.assertEqual(cli.Config({}).settings["projects_root"], "~")
 
+    def test_recorded_resets_are_shared_and_each_use_counted_once(self):
+        from cas import resetlog
+
+        for name in self.homes:
+            with self.on(name):
+                cli.Config({"settings": self.settings}).save()
+        acct = "acct-1"
+        with self.on("laptop"):
+            resetlog.set_count(acct, 4, "full", None)
+        t = time.time()
+        with self.on("desktop"):
+            self.assertEqual(resetlog.merged(acct)["left"], 4, "recorded on the laptop, seen on the desktop")
+            resetlog.note_use(acct, t + 50, t + 500)  # the desktop saw the drop late
+        with self.on("laptop"):
+            resetlog.note_use(acct, t + 100, t + 200)  # same reset, seen sooner
+            self.assertEqual(resetlog.merged(acct)["left"], 3, "one reset, seen by both machines")
+            resetlog.note_use(acct, t + 1000, t + 1100)  # a second one
+        with self.on("desktop"):
+            self.assertEqual(resetlog.merged(acct)["left"], 2)
+            with mock.patch.object(resetlog.time, "time", return_value=t + 2000):
+                resetlog.set_count(acct, 10, "full", None)  # re-read from claude.ai later: newest wins
+        with self.on("laptop"):
+            self.assertEqual(resetlog.merged(acct)["left"], 10)
+        self.assertEqual(sorted(p.name for p in (self.store / "resets").iterdir()), ["desktop.json", "laptop.json"])
+
     def test_project_only_on_other_machine_is_created_here(self):
         (self.mem("laptop", "Projects/OnlyHere") / "MEMORY.md").write_text("- x\n")
         self.sync("laptop")

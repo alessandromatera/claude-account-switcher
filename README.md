@@ -73,16 +73,27 @@ with their first prompt, asks which one to move, and warns if one still seems op
 
 ## Limit resets
 
-Some accounts get limit resets: grants that clear the 5-hour or weekly limit early. Claude Code
-uses them through its `/limit-reset` command. `cas` reads their status and **never uses one by
-itself**:
+Some accounts get limit resets: grants that clear the 5-hour or weekly limit early (a full reset
+clears both). claude.ai lists them under Settings → Usage; Claude Code can use them through its
+`/limit-reset` command when that command is enabled for the account. `cas` **never uses one by
+itself**.
 
-- `cas status` lists them per account in the LIMIT RESETS column. `cas status --live` shows the
-  count, the kind (5-hour, weekly, full) and the date they expire.
-- `cas reset work` shows what that account has left and which resets it holds. It warns you if the
-  account still has room, and suggests an account you could switch to at no cost. After you
-  confirm, it opens Claude Code on that account with `/limit-reset`, and Claude Code asks you to
-  confirm once more before anything is used.
+- **Seeing them.** The usage endpoint doesn't share reset details with cas, so they usually show
+  as `?`. Record what claude.ai shows:
+  ```sh
+  cas reset <profile> --set 4 --kind full --expires "2026-12-10 23:00"
+  ```
+  From then on `cas status`, the status line and the limit menu show them. When an account's usage
+  drops sharply before its window resets, a reset was used (through cas, Claude Code or
+  claude.ai), and the count goes down by one.
+- **Using them.** `cas reset <profile>` shows what that account has left: the 5-hour window, the
+  weekly limit (a full or weekly reset also clears that) and the resets it holds. It also
+  suggests an account you could switch to at no cost. After you confirm, it opens Claude Code's
+  `/limit-reset` on that account, or, when Claude Code can't use resets there, claude.ai's usage
+  page, where you click "Reset for free" yourself.
+- **On several machines.** With `cas share` on, the count you record and the resets each machine
+  sees being used travel through the shared folder. Each machine writes only its own file there.
+  When two machines saw the same reset, their observation times overlap and it counts once.
 
 ## Shared memory
 

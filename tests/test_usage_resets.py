@@ -126,24 +126,24 @@ class SourcesTest(IsolatedHome):
 
     def test_manual_record_and_automatic_decrement(self):
         hub = Config.load().hub()
-        now = time.time()
-        resets.set_manual(hub.name, 4, "full", now + 18 * 86400)
+        resets.set_manual(hub, 4, "full", time.time() + 18 * 86400)
         rs = resets.best_status(hub)
         self.assertEqual(rs.count(), 4)
         self.assertIn("4 full resets", rs.summary())
         self.assertIn("as you recorded them", rs.summary())
+        t = time.time()
         # usage drops sharply while the window is still open: a reset was used
-        usage.record_snapshot(hub.name, usage.Snapshot(now - 60, "statusline", usage.Window(100, now + 7200),
-                                                        usage.Window(94, now + 86400), "acct-hub"))
-        usage.record_snapshot(hub.name, usage.Snapshot(now, "live", usage.Window(0, now + 5 * 3600),
-                                                        usage.Window(0, now + 7 * 86400), "acct-hub"))
+        usage.record_snapshot(hub.name, usage.Snapshot(t + 60, "statusline", usage.Window(100, t + 7200),
+                                                        usage.Window(94, t + 86400), "acct-hub"))
+        usage.record_snapshot(hub.name, usage.Snapshot(t + 120, "live", usage.Window(0, t + 5 * 3600),
+                                                        usage.Window(0, t + 7 * 86400), "acct-hub"))
         self.assertEqual(resets.best_status(hub).count(), 3)
         # a normal window rollover is not a reset
-        usage.record_snapshot(hub.name, usage.Snapshot(now + 6 * 3600, "live", usage.Window(2, now + 11 * 3600),
-                                                        usage.Window(1, now + 7 * 86400), "acct-hub"))
+        usage.record_snapshot(hub.name, usage.Snapshot(t + 6 * 3600, "live", usage.Window(2, t + 11 * 3600),
+                                                        usage.Window(1, t + 7 * 86400), "acct-hub"))
         self.assertEqual(resets.best_status(hub).count(), 3)
-        resets.set_manual(hub.name, 0)
-        self.assertIsNone(resets.manual_status(hub.name))
+        resets.set_manual(hub, 0)
+        self.assertEqual(resets.best_status(hub).count(), 0)
 
     def test_cache_from_other_account_is_ignored(self):
         data = self.read_json(self.hub_json)
