@@ -93,8 +93,38 @@ def login_stranded(p: Profile, now: float) -> bool:
     return stranded
 
 
+def started_outside(cfg: Config, p: Optional[Profile], env: Dict[str, str]) -> Optional[Profile]:
+    """The account cas is on, when this session was started without cas on another one.
+
+    cas sets CAS_PROFILE on every session it starts; a session without it or CLAUDE_CONFIG_DIR ran
+    the claude binary directly, e.g. from a terminal opened before `cas init` added the shell
+    function, so it landed on ~/.claude whatever account cas is using.
+    """
+    if p is None or env.get("CAS_PROFILE") or env.get("CLAUDE_CONFIG_DIR"):
+        return None
+    from .cli import active_profile  # cli imports this module lazily: no cycle
+
+    want = active_profile(cfg)
+    return want if want.name != p.name else None
+
+
+def outside_fix(env: Dict[str, str], transcript: Any) -> str:
+    """One command, run after exiting, that fixes this shell and reopens the conversation on cas's account."""
+    from .cli import shell_hook_rc
+
+    rc = shell_hook_rc(env.get("SHELL"))
+    if rc is not None:
+        first = f"source ~/{rc.name}"
+    else:
+        first = "cas init && source ~/" + (".bashrc" if os.path.basename(env.get("SHELL", "")) == "bash"
+                                            else ".zshrc")
+    # nothing to carry over until the first message has written the transcript
+    empty = isinstance(transcript, str) and transcript and not os.path.exists(transcript)
+    return f"{first} && claude" + ("" if empty else " -c")
+
+
 def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True,
-           keychain_locked: bool = False) -> str:
+           keychain_locked: bool = False, outside: Optional[Profile] = None, fix: str = "") -> str:
     now = time.time() if now is None else now
     c = _c if color else (lambda _code, s: s)
     if p is None:
@@ -128,6 +158,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         else:
             soon = min((x.five_resets for _, x in items if x.five_resets), default=None)
             line += " │ " + c("31", "all accounts at limit" + (f" · first reset {_hm(soon)}" if soon else ""))
+    elif outside is not None:
+        line += " │ " + c("33", f"⚠ opened outside cas, which is on {outside.name} → exit, then: {fix}")
     elif alt:
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
         line += c("2", f" │ next: {alt.profile.name} {left}")
@@ -161,7 +193,13 @@ def main(raw: str, cfg: Optional[Config] = None, env: Optional[Dict[str, str]] =
         locked = p is not None and login_stranded(p, now)
     except OSError:
         locked = False
-    ours = render(cfg, p, now, keychain_locked=locked)
+    env = os.environ if env is None else env
+    try:
+        outside = started_outside(cfg, p, env)
+        fix = outside_fix(env, data.get("transcript_path") if isinstance(data, dict) else None) if outside else ""
+    except OSError:
+        outside, fix = None, ""
+    ours = render(cfg, p, now, keychain_locked=locked, outside=outside, fix=fix)
     chain = cfg.settings.get("statusline_chain")
     if chain:
         before = run_chain(chain, raw)

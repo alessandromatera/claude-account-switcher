@@ -1718,8 +1718,15 @@ def _read_rc(rc: Path) -> Optional[str]:
         return None
 
 
+def shell_hook_rc(shell: Optional[str] = None) -> Optional[Path]:
+    """The rc file that holds the `claude` function: the one `shell` reads, if it has it."""
+    have = [rc for rc in shell_rc_files(existing_only=True) if SHELL_BEGIN in (_read_rc(rc) or "")]
+    mine = ".bashrc" if os.path.basename(shell or "") == "bash" else ".zshrc"
+    return next((rc for rc in have if rc.name == mine), have[0] if have else None)
+
+
 def shell_hook_installed() -> bool:
-    return any(SHELL_BEGIN in (_read_rc(rc) or "") for rc in shell_rc_files(existing_only=True))
+    return shell_hook_rc() is not None
 
 
 def install_shell_hook() -> str:

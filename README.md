@@ -50,6 +50,12 @@ session can't change account. Exceptions:
 - An account you already chose is kept: a shell with `cas env` applied, or a `claude` started inside
   a session.
 
+The function works in terminals opened after `cas init`; in one that was already open, `claude`
+still runs on `~/.claude` until you `source ~/.zshrc`. When that puts a session on another account
+than cas's, its status line says so and gives the fix:
+`⚠ opened outside cas, which is on work → exit, then: source ~/.zshrc && claude -c`
+(`claude -c` reopens the same conversation, now on `work`).
+
 **Inside Claude Code:**
 - The status line shows the current account, what's left and when it resets, plus the next account:
   `work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%`.

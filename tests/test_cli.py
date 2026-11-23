@@ -85,6 +85,27 @@ class CliTest(IsolatedHome):
         out = statusline.main(json.dumps(payload), cfg, {})
         self.assertIn("cas handoff", out)
 
+    def test_statusline_flags_a_session_started_outside_cas(self):
+        self.add_profile()
+        cfg = Config.load()
+        cli.set_global(last_profile="work")  # cas is on work; a stale terminal ran the claude binary
+        out = statusline.main("{}", cfg, {"SHELL": "/bin/zsh"})
+        self.assertIn("opened outside cas, which is on work", out)
+        self.assertIn("exit, then: cas init && source ~/.zshrc && claude -c", out)  # no shell function yet
+        self.assertNotIn("next:", out)
+
+        (self.home / ".zshrc").write_text(cli.SHELL_BLOCK)
+        self.assertIn("then: source ~/.zshrc && claude -c", statusline.main("{}", cfg, {"SHELL": "/bin/zsh"}))
+        # no message sent yet: nothing to continue
+        fresh = json.dumps({"session_id": "s1", "transcript_path": str(self.home / "none.jsonl")})
+        self.assertIn("source ~/.zshrc && claude\x1b", statusline.main(fresh, cfg, {"SHELL": "/bin/zsh"}))
+
+        # started by cas, on any account, or on an account chosen with CLAUDE_CONFIG_DIR: no warning
+        self.assertNotIn("outside cas", statusline.main("{}", cfg, cfg.hub().env({})))
+        self.assertNotIn("outside cas", statusline.main("{}", cfg, cfg.get("work").env({})))
+        cli.set_global(last_profile=cfg.hub().name)
+        self.assertNotIn("outside cas", statusline.main("{}", cfg, {}))
+
     def test_latest_session_and_carry_flags(self):
         cfg = Config.load()
         d = self.hub / "projects" / cli.sanitize("/my/proj")
