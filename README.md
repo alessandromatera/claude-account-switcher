@@ -37,7 +37,7 @@ open the login URL in a private window.
 | `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account; `cas env` alone gives the current account |
 | `cas rename old new` | Rename a profile; its login is kept (names may contain dots, e.g. `gmail.com`) |
 | `cas share --store …` | Share memory with your other machines through a synced folder (see below) |
-| `cas doctor` / `cas sync` | Check the setup / repair shared links and files |
+| `cas doctor` / `cas sync` | Check the setup / repair shared links, files and stale logins |
 
 **Plain `claude`** starts on the current account: the one cas last started or handed off to
 (`cas status` names it). For that, `cas init` adds a small `claude` shell function to `~/.zshrc`
@@ -78,6 +78,35 @@ handoff resumes exactly that one, even with other sessions open in the same fold
 `cas handoff` (run after exiting) lists the conversations used in this folder in the last 6 hours
 with their first prompt, asks which one to move, and warns if one still seems open elsewhere.
 `--session <id>` picks one directly.
+
+## Logins over SSH (macOS Keychain)
+
+Claude Code keeps each account's login in the macOS login Keychain, or in
+`<config dir>/.credentials.json` when it can't write to the Keychain. Over SSH (and in a tmux
+started from SSH) the Keychain is often locked, and a locked Keychain can't be read without a
+password prompt that SSH can't show. Without cas stepping in, an account looks logged out after a while:
+
+- A login saved while the Keychain was unlocked can't be read once it locks. A new session says
+  "Not logged in". One already running stops at its next token renewal (within 8 hours), because
+  Claude Code won't move the login out of the Keychain.
+- A login made while the Keychain is locked goes to `.credentials.json`, but the Keychain keeps
+  the old copy. Once the Keychain unlocks, Claude Code reads that stale copy first.
+
+So before Claude Code starts (`cas run`, plain `claude`, `cas handoff`, pings), cas keeps one
+login per account:
+- **Stale copy.** When `.credentials.json` holds a newer login than the Keychain, cas deletes the
+  Keychain copy. This works while the Keychain is locked. cas compares when each copy was
+  written, so it never reads the secret.
+- **Login only in the locked Keychain.** cas offers to unlock it with `security unlock-keychain`
+  (macOS asks for your Mac password; cas never sees it). If the Keychain locks itself again
+  (idle timeout or sleep), cas says so and offers to stop that, because a session still open
+  then can't renew its login.
+- **Inside a session.** If the login of a running session ends up in the locked Keychain, the status
+  line warns while there is still time: `⚠ Keychain locked: this login can't renew → security
+  unlock-keychain` (run it in any terminal on that Mac).
+
+Scheduled pings don't start Claude Code on a login they can't use; they log why instead.
+`cas doctor` shows where each login is stored.
 
 ## Limit resets
 

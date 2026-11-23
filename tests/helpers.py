@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PRO_ACCOUNT = {
     "accountUuid": "acct-hub",
@@ -16,6 +17,10 @@ class IsolatedHome(unittest.TestCase):
     """Every test gets a throwaway HOME with a fake ~/.claude hub."""
 
     def setUp(self):
+        # Never touch the real macOS Keychain; tests/test_keychain.py fakes `security` instead.
+        kc = mock.patch("cas.keychain.supported", return_value=False)
+        kc.start()
+        self.addCleanup(kc.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self._env = {k: os.environ.get(k) for k in

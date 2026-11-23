@@ -315,6 +315,11 @@ def read_oauth(profile: Profile) -> Optional[Dict[str, Any]]:
 def fetch_live(profile: Profile, timeout: float = 8.0) -> Tuple[Optional[Snapshot], Optional[str]]:
     oauth = read_oauth(profile)
     if not oauth or not oauth.get("accessToken"):
+        from . import keychain
+
+        login = keychain.check(profile)
+        if login is not None and login.stranded:
+            return None, "login is in the locked Keychain (security unlock-keychain)"
         return None, "not logged in"
     exp = parse_time(oauth.get("expiresAt"))
     if exp is not None and exp < time.time() + 60:

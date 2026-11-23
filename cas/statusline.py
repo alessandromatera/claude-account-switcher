@@ -7,6 +7,10 @@ every other cas command knows this account's live usage for free), remembers the
 
     work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%
 
+When this account's login is in the locked macOS Keychain (common over SSH), the session can't
+renew it and will ask for /login once its token expires: the line says so while there is time
+to unlock it.
+
 If a status line was configured before cas, it still runs; its output comes first.
 """
 
@@ -18,7 +22,7 @@ import subprocess
 import time
 from typing import Any, Dict, Optional
 
-from . import picker, resets
+from . import keychain, picker, resets
 from .config import Config, Profile
 from .usage import (
     best_snapshot,
@@ -30,6 +34,7 @@ from .usage import (
 )
 
 WRITE_EVERY_S = 30
+KEYCHAIN_CHECK_EVERY_S = 60
 
 
 def _c(code: str, s: str) -> str:
@@ -74,7 +79,22 @@ def _record(p: Profile, data: Dict[str, Any], now: float) -> None:
         save_state(p.name, st)
 
 
-def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True) -> str:
+def login_stranded(p: Profile, now: float) -> bool:
+    """The session's login is in the locked Keychain (checked at most once a minute)."""
+    st = load_state(p.name)
+    last = st.get("keychain_check") if isinstance(st.get("keychain_check"), dict) else {}
+    if now - float(last.get("at", 0)) < KEYCHAIN_CHECK_EVERY_S:
+        return bool(last.get("stranded"))
+    login = keychain.check(p)
+    stranded = bool(login and login.stranded)
+    st = load_state(p.name)
+    st["keychain_check"] = {"at": now, "stranded": stranded}
+    save_state(p.name, st)
+    return stranded
+
+
+def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True,
+           keychain_locked: bool = False) -> str:
     now = time.time() if now is None else now
     c = _c if color else (lambda _code, s: s)
     if p is None:
@@ -111,6 +131,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
     elif alt:
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
         line += c("2", f" │ next: {alt.profile.name} {left}")
+    if keychain_locked:
+        line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")
     return line
 
 
@@ -135,7 +157,11 @@ def main(raw: str, cfg: Optional[Config] = None, env: Optional[Dict[str, str]] =
             _record(p, data, now)
         except OSError:
             pass
-    ours = render(cfg, p, now)
+    try:
+        locked = p is not None and login_stranded(p, now)
+    except OSError:
+        locked = False
+    ours = render(cfg, p, now, keychain_locked=locked)
     chain = cfg.settings.get("statusline_chain")
     if chain:
         before = run_chain(chain, raw)

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, launchd, picker, planner, resets, shared
+from . import __version__, keychain, launchd, picker, planner, resets, shared
 from . import profiles as prof
 from .config import (
     NAME_RULES,
@@ -693,6 +693,46 @@ def prime_others(cfg: Config, target: Profile, style: Style, now: Optional[float
     return started
 
 
+def ensure_login(p: Profile, style: Style, interactive: bool, out: Any = None) -> None:
+    """Before Claude Code starts on `p`: one login per account, and one Claude Code can use.
+
+    Over SSH the macOS Keychain is usually locked, and a login kept there can't be read or
+    renewed (see keychain.py). A stale Keychain copy is removed without asking; a login only
+    the locked Keychain holds needs it unlocked, which macOS asks the password for.
+    """
+    out = out or sys.stdout
+    try:
+        login, actions = keychain.settle(p)
+    except Exception:  # never stop Claude Code from starting over this
+        return
+    for a in actions:
+        print(style.dim(f"· {p.name}: {a}"), file=out)
+    if login is None or not login.stranded:
+        return
+    print(style.warn(f"{p.name}'s login is in the macOS Keychain, which is locked (usual over SSH). Claude Code "
+                     "can't read or renew it there, so it would ask you to log in again."), file=out)
+    if not (interactive and sys.stdin.isatty()):
+        print(style.dim("  Unlock it with `security unlock-keychain`, or log in again: a login made while the "
+                        "Keychain is locked goes to .credentials.json and keeps working."), file=out)
+        return
+    if not confirm("Unlock the Keychain now? macOS asks for your Mac password.", default=True):
+        print(style.dim("  Starting anyway. If Claude Code asks, /login: with the Keychain locked the login goes to "
+                        ".credentials.json, and cas drops the old Keychain copy next time."), file=out)
+        return
+    if not keychain.unlock():
+        print(style.warn("  The Keychain is still locked."), file=out)
+        return
+    print(style.good("✓ Keychain unlocked"), file=out)
+    how = keychain.autolock()
+    if how:
+        print(style.dim(f"  It locks again {how}. A session still open then can't renew its login and asks you "
+                        "to log in again."), file=out)
+        if confirm("Keep it unlocked until you log out or restart the Mac? (security set-keychain-settings)",
+                   default=False):
+            print(style.good("✓ The Keychain no longer locks by itself") if keychain.keep_unlocked()
+                  else style.warn("  Could not change the Keychain settings."), file=out)
+
+
 def run_claude(claude: str, args: List[str], p: Profile) -> int:
     try:
         return subprocess.call([claude, *args], env=p.env())
@@ -715,6 +755,7 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
             return rc
         for a in prof.prepare(p, cfg.profile_list(), cfg.settings.get("sync_mcp", True)):
             print(style.dim(f"· {a}"))
+        ensure_login(p, style, interactive=True)
         args = list(claude_args)
         if p.model and not has_flag(args, "--model"):
             args = ["--model", p.model] + args
@@ -877,6 +918,13 @@ def cmd_claude(argv: List[str]) -> int:
         except Exception as e:  # a failed sync must never stop claude from starting
             if talk:
                 print(style.dim(f"· sync failed: {e}"), file=sys.stderr)
+        if talk:
+            ensure_login(p, style, interactive=True, out=sys.stderr)
+        else:
+            try:
+                keychain.settle(p)
+            except Exception:
+                pass
         if p.model and sub is None and not has_flag(args, "--model"):
             args = ["--model", p.model] + args
         env = p.env(env)
@@ -1074,6 +1122,11 @@ def _login(cfg: Config, p: Profile, email: Optional[str]) -> int:
         print("Login did not complete. Retry with: cas login " + p.name)
         return rc or 1
     print(f"✓ {p.name}: {acct.get('emailAddress')} ({p.plan})")
+    try:
+        for a in keychain.settle(p)[1]:
+            print(f"· {a}")
+    except Exception:
+        pass
     dup = [q.name for q in cfg.profile_list() if q.name != p.name and q.account_uuid == acct.get("accountUuid")]
     if dup:
         print(f"⚠ This is the same account as profile(s): {', '.join(dup)}. Sharing quota gains nothing; "
@@ -1206,6 +1259,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
         for a in acts:
             print(f"{p.name}: {a}")
         n += len(acts)
+    for p in targets:
+        if p.dir.exists():
+            for a in keychain.settle(p)[1]:
+                print(f"{p.name}: {a}")
+                n += 1
     if cfg.settings.get("shared_store"):
         acts = shared.sync(cfg.settings, quick=args.quick)
         _log_share(acts)
@@ -1392,6 +1450,16 @@ def do_ping(cfg: Config, p: Profile, model: Optional[str], force: bool, schedule
             return True
     if not p.logged_in():
         _log(f"{p.name}: not logged in, cannot open a window (cas login {p.name})")
+        return False
+    try:
+        login, fixed = keychain.settle(p)
+    except Exception:
+        login, fixed = None, []
+    for a in fixed:
+        _log(f"{p.name}: {a}")
+    if login is not None and login.stranded:
+        _log(f"{p.name}: its login is in the macOS Keychain, which is locked; cannot open a window "
+             "(unlock it with `security unlock-keychain`)")
         return False
     snap, _ = refresh(p, s)
     e = effective(snap, now)
@@ -1753,16 +1821,6 @@ def uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
-def keychain_has(p: Profile) -> Optional[bool]:
-    if sys.platform != "darwin":
-        return None
-    from .config import keychain_account
-
-    r = subprocess.run(["security", "find-generic-password", "-a", keychain_account(), "-s", p.keychain_service],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return r.returncode == 0
-
-
 def cmd_doctor(args: argparse.Namespace) -> int:
     cfg = Config.load()
     style = make_style()
@@ -1792,6 +1850,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(f"{bad} plain claude: always on ~/.claude ({cfg.hub().name}); `cas init` makes it follow the "
               "current account")
+    if keychain.supported():
+        locked = keychain.is_locked()
+        if locked:
+            print(f"{ok} Keychain: locked (usual over SSH). Logins made now go to .credentials.json; one kept in "
+                  "the Keychain can't be used until it's unlocked")
+        elif locked is False:
+            how = keychain.autolock()
+            print(f"{ok} Keychain: unlocked" + (f"; locks again {how}, and a session open then can't renew a "
+                                                 "login kept there" if how else ""))
     seen: Dict[str, str] = {}
     for p in cfg.profile_list():
         label = f"profile {p.name} ({p.dir})"
@@ -1802,9 +1869,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         issues = prof.link_problems(p)
         if not p.logged_in():
             issues.append("not logged in (cas login %s)" % p.name)
-        kc = keychain_has(p)
-        if p.logged_in() and kc is False and not (p.dir / ".credentials.json").exists():
-            issues.append("no stored credentials found")
+        login = keychain.check(p) if p.logged_in() else None
+        if login is not None:
+            if login.in_keychain is False and not login.in_file:
+                issues.append(f"no stored login found (cas login {p.name})")
+            elif login.stranded:
+                issues.append("its login is in the locked Keychain: Claude Code can't read or renew it "
+                              "(security unlock-keychain, or log in again)")
+            elif login.stale_keychain_copy:
+                issues.append("an older copy of its login is in the Keychain and takes over when the Keychain "
+                              "unlocks (cas sync removes it)")
         if p.account_uuid and p.account_uuid in seen:
             issues.append(f"same account as {seen[p.account_uuid]}")
         if p.account_uuid:
@@ -1813,7 +1887,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             problems += 1
             print(f"{bad} {label}: " + "; ".join(issues))
         else:
-            print(f"{ok} {label}: {p.email} ({p.plan})")
+            print(f"{ok} {label}: {p.email} ({p.plan})" + (f", login in {login.where()}" if login else ""))
     if launchd.supported():
         inst = launchd.installed()
         print(f"{ok} schedule: " + (", ".join(f"{n} ({len(e)}/week)" for n, e in inst.items()) if inst else "none"))
