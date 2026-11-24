@@ -6,11 +6,13 @@ every other cas command knows this account's live usage for free), remembers the
 (so `cas handoff` can resume it on another account), fetches the other accounts' usage in the
 background when it's out of date (it shows on a later refresh), and prints one line:
 
-    work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%
+    work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100% · wk 41%
 
-When no other account has room, it shows the one that frees up first instead of `next:`:
+When no other account has room, it shows the one that frees up first instead of `next:`, also
+at this account's limit:
 
-    work 5h 58% left ↻14:20 · wk 76% │ personal 5h 0% ↻15:10 ⟲
+    work 5h 58% left ↻14:20 · wk 76% │ personal 5h 0% ↻15:10 · wk 41% · ⟲
+    work 5h 8% left ↻14:20 · wk 76% · ⟲1 │ limit reset available: /limit-reset │ personal 5h 0% ↻15:10 · wk 41%
 
 Near the limit, while this conversation's agents are at work, it says so: they stop when the
 account does, so switching once they're done interrupts nothing. At the limit it says how many
@@ -58,6 +60,14 @@ def _left_color(left: float) -> str:
 
 def _hm(ts: Optional[float]) -> str:
     return time.strftime("%H:%M", time.localtime(ts + 30)) if ts else ""  # to the nearest minute
+
+
+def _week(e: Any, c: Any) -> Optional[str]:
+    """What's left of the weekly limit: dim, coloured once it runs low."""
+    if e.week_pct is None:
+        return None
+    wl = max(0.0, 100 - e.week_pct)
+    return c(_left_color(wl) if wl <= 40 else "2", f"wk {wl:.0f}%")
 
 
 def _old(sec: float) -> str:
@@ -177,10 +187,13 @@ def waiting(cfg: Config, b: picker.Blocked, now: float, c: Any) -> str:
     out = c("2", f" │ {b.profile.name} ") + c(_left_color(left), f"{label} {left:.0f}%")
     if at:
         out += c("2", f" ↻{when(at, now)}")
+    wk = _week(e, c) if label == "5h" else None  # stopped by the week: that's the figure above
+    if wk:
+        out += c("2", " · ") + wk
     rs = resets.best_status(b.profile, now)
     n = rs.count(now) if rs else None
     if n or (rs and rs.has_any(now)):
-        out += " " + c("36", f"⟲{n or ''}")  # a reset there would free it now: `cas reset`
+        out += c("2", " · ") + c("36", f"⟲{n or ''}")  # a reset there would free it now: `cas reset`
     if e.age is not None and e.age > 2 * float(cfg.settings.get("live_max_age_s", 300)):
         out += c("2", f" ({_old(e.age)})")
     return out
@@ -201,9 +214,9 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         left = max(0.0, 100 - e.five_pct)
         txt = f"5h {left:.0f}% left" + (f" ↻{_hm(e.five_resets)}" if e.five_resets else "")
         parts.append(c(_left_color(left), txt))
-    if e.week_pct is not None:
-        wl = max(0.0, 100 - e.week_pct)
-        parts.append(c(_left_color(wl) if wl <= 40 else "2", f"wk {wl:.0f}%"))
+    wk = _week(e, c)
+    if wk:
+        parts.append(wk)
     rs = resets.best_status(p, now)
     n = rs.count(now) if rs else None
     if n:
@@ -215,6 +228,7 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
     items = [(q, effective(best_snapshot(q), now)) for q in cfg.profile_list()]
     ordered, blocked = picker.rank(items, cfg.settings, exclude={p.name})
     alt = ordered[0] if ordered else None
+    other = waiting(cfg, blocked[0], now, c) if alt is None and blocked else ""  # none has room
     exhausted = picker.exhausted(e, cfg.settings)
     running = subagents.running(agents, now) if not exhausted and near_limit(e, cfg.settings) else []
     if exhausted:
@@ -225,6 +239,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
                               (f", which continues the {_agents(len(stopped))}" if stopped else ""))
         elif n or (rs and rs.has_any(now)):
             line += " │ " + c("36", "limit reset available: /limit-reset")
+        elif other:  # it shows when the other one resets
+            line += " │ " + c("31", "all accounts at limit")
         else:
             soon = min((x.five_resets for _, x in items if x.five_resets), default=None)
             line += " │ " + c("31", "all accounts at limit" + (f" · first reset {_hm(soon)}" if soon else ""))
@@ -238,9 +254,10 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
     elif alt:
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
         old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
-        line += c("2", f" │ next: {alt.profile.name} {left}" + (f" ({_old(alt.eff.age)})" if old else ""))
-    elif blocked:
-        line += waiting(cfg, blocked[0], now, c)
+        wk = _week(alt.eff, c)
+        line += c("2", f" │ next: {alt.profile.name} {left}") + (c("2", " · ") + wk if wk else "") + \
+            (c("2", f" ({_old(alt.eff.age)})") if old else "")
+    line += other
     if keychain_locked:
         line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")
     return line

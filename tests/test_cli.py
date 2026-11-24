@@ -83,7 +83,7 @@ class CliTest(IsolatedHome):
         now = time.time()
         usage.record_snapshot("default", usage.Snapshot(now - 1800, "live", usage.Window(8, now + 3600),
                                                          usage.Window(50, now + 86400), "acct-hub"))
-        self.assertIn("next: default 92% (30m old)", statusline.render(cfg, p, now, color=False))
+        self.assertIn("next: default 92% · wk 50% (30m old)", statusline.render(cfg, p, now, color=False))
         # garbage input never raises
         self.assertIn("default", statusline.main("not json", cfg, {}))
 
@@ -105,18 +105,37 @@ class CliTest(IsolatedHome):
         usage.record_snapshot("work", usage.Snapshot(now, "statusline", usage.Window(50, now + 3600),
                                                       usage.Window(40, now + 86400), "acct-work"))
         out = statusline.render(cfg, p, now, color=False)
-        self.assertIn(f"│ default 5h 0% ↻{cli.when(at, now)}", out)
+        self.assertIn(f"│ default 5h 0% ↻{cli.when(at, now)} · wk 43%", out)  # its week too
         self.assertNotIn("next:", out)
         # a reset there would free it now
         resets.record("default", resets.parse_status({"eligible": True, "grants": [
             {"id": "g1", "resets_left": 2, "clears": ["five_hour"], "type": "session"}]}, now))
-        self.assertIn(f"↻{cli.when(at, now)} ⟲2", statusline.render(cfg, p, now, color=False))
+        self.assertIn(f"↻{cli.when(at, now)} · wk 43% · ⟲2", statusline.render(cfg, p, now, color=False))
         # stopped by its weekly limit instead
         usage.record_snapshot("default", usage.Snapshot(now + 1, "live", usage.Window(10, at),
                                                          usage.Window(99, now + 4 * 86400), "acct-hub"))
         later = now + 1801  # and that reading stayed old
         out = statusline.render(cfg, p, later, color=False)
-        self.assertIn(f"│ default wk 1% ↻{cli.when(now + 4 * 86400, later)} ⟲2 (30m old)", out)
+        self.assertIn(f"│ default wk 1% ↻{cli.when(now + 4 * 86400, later)} · ⟲2 (30m old)", out)
+        self.assertEqual(out.count("wk "), 2)  # once for each account: its weekly limit is the figure shown
+
+    def test_statusline_shows_the_other_account_at_the_limit_when_it_has_no_room(self):
+        p = self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        at = now + 3 * 3600
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, at),
+                                                         usage.Window(57, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "statusline", usage.Window(92, now + 3600),
+                                                      usage.Window(65, now + 86400), "acct-work"))
+        out = statusline.render(cfg, p, now, color=False)
+        self.assertIn(f"│ all accounts at limit │ default 5h 0% ↻{cli.when(at, now)} · wk 43%", out)
+        self.assertNotIn("first reset", out)  # each account shows its own
+        # a reset here would free this one: say so, and still show the other
+        resets.record("work", resets.parse_status({"eligible": True, "grants": [
+            {"id": "g1", "resets_left": 1, "clears": ["five_hour"], "type": "session"}]}, now))
+        out = statusline.render(cfg, p, now, color=False)
+        self.assertIn(f"│ limit reset available: /limit-reset │ default 5h 0% ↻{cli.when(at, now)} · wk 43%", out)
 
     def test_statusline_flags_a_session_started_outside_cas(self):
         self.add_profile()
