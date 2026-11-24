@@ -1,12 +1,15 @@
 import io
 import json
 import os
+import plistlib
+import subprocess
+import sys
 import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from cas import cli, launchd, planner, resets, statusline, usage
+from cas import __version__, cli, current, launchd, planner, resets, shared, statusline, usage
 from cas.config import Config
 from tests.helpers import IsolatedHome
 
@@ -288,6 +291,7 @@ class CliTest(IsolatedHome):
         try:
             os.chdir(proj)
             with mock.patch.object(cli, "find_claude", return_value=str(fake)), \
+                    mock.patch.object(cli, "refresh_in_background", return_value=[]), \
                     mock.patch("sys.stdin.isatty", return_value=bool(answers)), \
                     mock.patch("builtins.input", side_effect=lambda *_: answers.pop(0)), \
                     redirect_stdout(io.StringIO()) as out:
@@ -508,6 +512,85 @@ class CliTest(IsolatedHome):
         self.assertEqual(real.read_text(), "x\n")
         self.assertFalse(cli.shell_hook_installed())
 
+    def test_fresh_sessions_follow_the_account_chosen_on_another_machine(self):
+        """Limits belong to the account: after a switch on one Mac, the other's fresh sessions follow."""
+        self.add_profile()  # work = acct-work
+        store = self.home / "store"
+        cfg = Config.load()
+        cfg.settings["shared_store"] = str(store)
+        cfg.save()
+        cfg = Config.load()
+        now = time.time()
+        theirs = store / "current" / "MBP.json"
+        with mock.patch.object(shared, "host", return_value="studio"):
+            current.set_current(cfg, cfg.hub(), now)
+            self.assertEqual(self.read_json(store / "current" / "studio.json"), {"account": "acct-hub", "at": now})
+            self.assertEqual(cli.active_profile(cfg).name, cfg.hub().name)
+
+            self.write_json(theirs, {"account": "acct-work", "at": now + 60})  # the MBP moved to work
+            p, where = current.get_current(cfg)
+            self.assertEqual((p.name, where), ("work", "MBP"))
+            self.assertEqual(self.fake_exec("hi")[2], "work")
+            with mock.patch.object(cli, "shell_hook_installed", return_value=True):
+                self.assertIn("starts on work, the account cas last used on MBP", run_cli("status", "--no-live")[1])
+
+            self.write_json(theirs, {"account": "acct-nobody-here", "at": now + 90})  # no profile for it here
+            self.assertEqual(cli.active_profile(cfg).name, cfg.hub().name)
+            self.write_json(theirs, {"account": "acct-work", "at": now + 60})
+            current.set_current(cfg, cfg.hub(), now + 120)  # a newer choice here wins again
+            self.assertEqual(current.get_current(cfg)[1], None)
+            self.assertEqual(cli.active_profile(cfg).name, cfg.hub().name)
+
+            rc, out = run_cli("use", "work")  # choose without starting a session
+            self.assertEqual(rc, 0, out)
+            self.assertIn("starts on work on all your machines", out)
+            self.assertEqual(self.read_json(store / "current" / "studio.json")["account"], "acct-work")
+            self.assertEqual(cli.active_profile(Config.load()).name, "work")
+            run_cli("add", "third", "--no-login")
+            self.assertNotEqual(cli.main(["use", "third"]), 0, "not logged in: refused")
+
+    def test_install_runs_cas_from_a_copy_and_points_everything_at_it(self):
+        """Edits to the source folder (kept in Dropbox) must not change the cas in use until `cas install`."""
+        src = cli.SCRIPT.parent.parent
+        self.write_json(self.hub / "settings.json", {"statusLine": {
+            "type": "command", "command": f"/usr/bin/python3 {cli.SCRIPT} statusline"}})
+        link = self.home / ".local" / "bin" / "cas"
+        link.parent.mkdir(parents=True)
+        os.symlink(cli.SCRIPT, link)
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        with open(agents / f"{launchd.LABEL_PREFIX}work.plist", "wb") as fh:
+            plistlib.dump(launchd.build_plist("work", [{"Hour": 6, "Minute": 0}], "/py", str(cli.SCRIPT), "/bin"), fh)
+        dest = cli.install_dir()
+        script = dest / "bin" / "cas"
+        with mock.patch.object(launchd, "supported", return_value=True), \
+                mock.patch.object(launchd, "_launchctl", return_value=mock.Mock(returncode=0)):
+            rc, out = run_cli("install")
+            self.assertEqual(rc, 0, out)
+            script = script.resolve()
+            self.assertEqual(cli.install_differs(src, dest), [])
+            self.assertEqual(self.read_json(dest / cli.INSTALL_MARK)["source"], str(src))
+            self.assertEqual(os.path.realpath(link), str(script))
+            self.assertIn(str(script), self.read_json(self.hub / "settings.json")["statusLine"]["command"])
+            with open(agents / f"{launchd.LABEL_PREFIX}work.plist", "rb") as fh:
+                self.assertEqual(plistlib.load(fh)["ProgramArguments"][1], str(script))
+            self.assertFalse((self.hub / "commands" / "accounts.md").exists(), "not set up before, so not added")
+            r = subprocess.run([sys.executable, str(script), "--version"], capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), f"cas {__version__}", r.stderr)
+
+            (dest / "cas" / "gone.py").write_text("")  # a module since removed from the source
+            self.assertEqual(run_cli("install")[0], 0)
+            self.assertFalse((dest / "cas" / "gone.py").exists())
+
+            # `cas install` from the installed copy installs again from the source, with the source's installer
+            with mock.patch.object(cli, "SCRIPT", script), mock.patch("subprocess.call", return_value=0) as call:
+                self.assertEqual(run_cli("install")[0], 0)
+            self.assertEqual(call.call_args[0][0][1:], [str(src / "bin" / "cas"), "install"])
+
+            run_cli("uninstall")
+        self.assertFalse(link.is_symlink() or link.exists())
+        self.assertFalse(dest.exists())
+
     def test_ping_skips_open_window_and_records_new_one(self):
         self.add_profile()
         cfg = Config.load()
@@ -524,6 +607,7 @@ class CliTest(IsolatedHome):
         with mock.patch.object(cli, "find_claude", return_value="/bin/claude"), \
                 mock.patch("subprocess.run", return_value=fake) as run, \
                 mock.patch.object(cli, "refresh", side_effect=lambda p, s, live=None: (usage.best_snapshot(p), None)), \
+                mock.patch.object(cli.time, "sleep") as sleep, \
                 redirect_stdout(io.StringIO()):
             self.assertTrue(cli.do_ping(cfg, p, None, False, False))
         argv = run.call_args[0][0]
@@ -532,6 +616,62 @@ class CliTest(IsolatedHome):
         snap = usage.best_snapshot(p)
         self.assertEqual(snap.source, "ping")
         self.assertAlmostEqual(snap.five_hour.resets_at, time.time() + 5 * 3600, delta=60)
+        self.assertEqual(sleep.call_count, len(cli.PING_SETTLE_WAITS), "kept asking for the exact reset")
+
+    def test_ping_waits_for_the_usage_endpoint_to_count_it(self):
+        """Right after a ping the endpoint still shows no 5-hour window: that reading must not
+        replace the window the ping opened (the status line showed `next: gmail ?`)."""
+        self.add_profile()
+        cfg = Config.load()
+        p = cfg.get("work")
+        exact = time.time() + 4 * 3600
+        readings = [usage.Window(None, None), usage.Window(0, exact)]  # not counted yet, then counted
+        calls = []
+
+        def live(prof, s, live=None):
+            calls.append(live)
+            if not live:  # the check before pinging: nothing cached
+                return usage.best_snapshot(prof), None
+            w = readings.pop(0)
+            usage.record_snapshot(prof.name, usage.Snapshot(time.time(), "live", w, usage.Window(50, exact + 86400),
+                                                            prof.account_uuid))
+            return usage.best_snapshot(prof), None
+
+        fake = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch.object(cli, "find_claude", return_value="/bin/claude"), \
+                mock.patch("subprocess.run", return_value=fake), \
+                mock.patch.object(cli, "refresh", side_effect=live), mock.patch.object(cli.time, "sleep"), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(cli.do_ping(cfg, p, None, False, False))
+        self.assertEqual(calls, [None, True, True], "asked again after the reading that missed the window")
+        snap = usage.best_snapshot(p)
+        self.assertEqual((snap.source, snap.five_hour.resets_at), ("live", exact))
+        self.assertNotIn("resets -", out.getvalue())
+
+    def test_session_start_refreshes_out_of_date_usage_in_the_background(self):
+        self.add_profile()
+        rc, _ = run_cli("add", "third", "--no-login")
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now - 60, "statusline", usage.Window(40, now + 3600),
+                                                         usage.Window(10, now + 86400), "acct-hub"))
+        with mock.patch("subprocess.Popen") as popen:
+            # default is fresh, third isn't logged in, work has no data at all
+            self.assertEqual(cli.refresh_in_background(cfg, now=now), ["work"])
+            self.assertEqual(popen.call_args[0][0][-2:], [cli.REFRESH_CMD, "work"])
+            self.assertTrue(popen.call_args[1]["start_new_session"])
+            self.assertEqual(cli.refresh_in_background(cfg, skip=["work"], now=now), [], "a ping refreshes it")
+            self.assertEqual(cli.refresh_in_background(cfg, now=now + 3600), ["default", "work"])
+            cfg.settings["live_usage"] = "never"
+            self.assertEqual(cli.refresh_in_background(cfg, now=now + 3600), [])
+        self.assertEqual(popen.call_count, 2)
+
+        cfg.settings["live_usage"] = "auto"
+        with mock.patch.object(cli, "refresh", return_value=(None, "token expired")) as ref, \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.main([cli.REFRESH_CMD, "work", "third", "gone"]), 0)
+        self.assertEqual([c[0][0].name for c in ref.call_args_list], ["work"])
+        self.assertIn("work: token expired", out.getvalue())
 
 
 if __name__ == "__main__":

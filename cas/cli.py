@@ -46,6 +46,7 @@ from .config import (
     write_json_atomic,
     write_text_atomic,
 )
+from .current import get_current, set_current
 from .usage import (
     FIVE_HOURS,
     Effective,
@@ -54,6 +55,7 @@ from .usage import (
     best_snapshot,
     effective,
     extra_summary,
+    live_due,
     load_state,
     record_snapshot,
     refresh,
@@ -67,6 +69,7 @@ LIMIT_RE = re.compile(
     re.I,
 )
 PING_PROMPT = "Reply with exactly one word: ok"
+PING_SETTLE_WAITS = (0, 3, 5, 10)  # seconds before each try at reading the window a ping opened
 
 # Flags carried over when a conversation moves to another account (others, like a prompt, are not).
 CARRY_FLAGS_NOARG = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--chrome", "--verbose"}
@@ -127,7 +130,7 @@ def when(ts: Optional[float], now: Optional[float] = None) -> str:
     if not ts:
         return "-"
     now = time.time() if now is None else now
-    lt, ln = time.localtime(ts), time.localtime(now)
+    lt, ln = time.localtime(ts + 30), time.localtime(now)  # to the nearest minute
     if lt.tm_yday == ln.tm_yday and lt.tm_year == ln.tm_year:
         return time.strftime("%H:%M", lt)
     if ts - now < 6 * 86400:
@@ -486,7 +489,8 @@ def print_status(cfg: Config, rows: List[Row], style: Style, now: float, mark_cu
                     p.email or style.dim("not logged in"), p.plan, five, week, rs, credits, data])
     print(table(out))
 
-    ordered, blocked = picker.rank([(r.profile, r.eff) for r in rows], cfg.settings)
+    ordered, blocked = picker.rank([(r.profile, r.eff) for r in rows], cfg.settings,
+                                   prefer=active_profile(cfg).name)
     print()
     if ordered:
         c = ordered[0]
@@ -508,8 +512,9 @@ def print_status(cfg: Config, rows: List[Row], style: Style, now: float, mark_cu
         print(style.dim("Limit resets are only used when you ask: `cas reset <profile>` opens /limit-reset or "
                         "claude.ai's usage page, and you confirm there."))
     if shell_hook_installed():
-        print(style.dim(f"A fresh `claude` starts on {active_profile(cfg).name}, the account cas last used "
-                        "(`cas run` picks the best one)."))
+        p, where = get_current(cfg)
+        print(style.dim(f"A fresh `claude` starts on {(p or cfg.hub()).name}, the account cas last used"
+                        + (f" on {where}" if where else "") + " (`cas run` picks the best one)."))
 
 
 # --------------------------------------------------------------------------- decisions at the limit
@@ -642,7 +647,7 @@ def resolve_target(cfg: Config, target: str, style: Style) -> Tuple[Optional[Pro
             print(style.warn(f"{p.name} is not logged in; Claude Code will ask you to log in."))
         return p, []
     rows = gather(cfg)
-    ordered, _ = picker.rank([(r.profile, r.eff) for r in rows], cfg.settings)
+    ordered, _ = picker.rank([(r.profile, r.eff) for r in rows], cfg.settings, prefer=active_profile(cfg).name)
     if ordered:
         c = ordered[0]
         print(style.dim(f"auto → {c.profile.name} · {c.reason}"))
@@ -691,6 +696,43 @@ def prime_others(cfg: Config, target: Profile, style: Style, now: Optional[float
         print(style.dim(f"· opening the 5-hour window of {', '.join(started)} in the background "
                         "(its reset comes sooner if you switch; prime_others_on_start)"))
     return started
+
+
+def refresh_in_background(cfg: Config, skip: Sequence[str] = (), now: Optional[float] = None) -> List[str]:
+    """Bring out-of-date usage up to date without delaying the start (`live_usage` decides what is).
+
+    The status line only reads what cas has recorded, so without this its `next:` would show "?"
+    or an old percentage for the whole session. An account in `skip` gets its own refresh (a ping).
+    """
+    now = time.time() if now is None else now
+    due = [q.name for q in cfg.profile_list() if q.enabled and q.logged_in() and q.name not in skip
+           and live_due(best_snapshot(q), cfg.settings, now)]
+    if not due:
+        return []
+    log = cas_home() / "logs" / "refresh.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "w") as fh:  # only the last run: this happens every time a session starts
+            subprocess.Popen([sys.executable, str(SCRIPT), REFRESH_CMD, *due], stdin=subprocess.DEVNULL,
+                             stdout=fh, stderr=subprocess.STDOUT, start_new_session=True, env=os.environ.copy())
+    except OSError:
+        return []
+    return due
+
+
+REFRESH_CMD = "_refresh"  # internal: the background half of refresh_in_background
+
+
+def cmd_refresh(names: Sequence[str]) -> int:
+    cfg = Config.load()
+    for n in names:
+        p = cfg.profiles.get(n)
+        if p is None or not p.logged_in():
+            continue
+        _, err = refresh(p, cfg.settings)  # checks again: another process may have just done it
+        if err:
+            _log(f"{p.name}: {err}")
+    return 0
 
 
 def ensure_login(p: Profile, style: Style, interactive: bool, out: Any = None) -> None:
@@ -768,8 +810,9 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
             own = str(uuid.uuid4())
             args = ["--session-id", own] + args
         started = time.time()
-        set_global(last_profile=p.name)
-        prime_others(cfg, p, style, started)
+        set_current(cfg, p, started)
+        primed = prime_others(cfg, p, style, started)
+        refresh_in_background(cfg, skip=primed, now=started)
         print(style.dim(f"→ Claude Code on {p.name} ({p.display()})"))
         rc = run_claude(claude, args, p)
         try:
@@ -885,12 +928,24 @@ HUB_SUBCOMMANDS = {"mcp", "plugin", "plugins", "install", "update", "upgrade", "
 
 
 def active_profile(cfg: Config) -> Profile:
-    """The account a fresh session starts on: the one cas last started or handed off to."""
-    last = global_state().get("last_profile")
-    p = cfg.profiles.get(last) if isinstance(last, str) else None
-    if p is None or not p.enabled or not p.logged_in():
-        return cfg.hub()
-    return p
+    """The account a fresh session starts on: the one cas last started or handed off to, on any of
+    your machines when `cas share` is on (current.py)."""
+    p, _ = get_current(cfg)
+    return p or cfg.hub()
+
+
+def cmd_use(args: argparse.Namespace) -> int:
+    """Make `profile` the current account without starting a session (on every machine, with cas share)."""
+    cfg = Config.load()
+    p = cfg.get(args.profile)
+    if not p.enabled:
+        return die(f"{p.name} is turned off (cas set {p.name} --enable)")
+    if not p.logged_in():
+        return die(f"{p.name} is not logged in (cas login {p.name})")
+    set_current(cfg, p)
+    where = " on all your machines" if cfg.settings.get("shared_store") else ""
+    print(f"A fresh `claude` now starts on {p.name}{where}; sessions already open stay on their account.")
+    return 0
 
 
 def cmd_claude(argv: List[str]) -> int:
@@ -929,6 +984,7 @@ def cmd_claude(argv: List[str]) -> int:
             args = ["--model", p.model] + args
         env = p.env(env)
         if talk:
+            refresh_in_background(cfg)  # for the status line, which only reads what cas recorded
             print(style.dim(f"→ Claude Code on {p.name} ({p.display()})"), file=sys.stderr)
     try:
         os.execve(claude, [claude, *args], env)
@@ -980,11 +1036,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
     cfg = Config.load()
     style = make_style()
     now = time.time()
-    if args.profile:
-        p = cfg.get(args.profile)
-    else:
-        last = global_state().get("last_profile")
-        p = cfg.get(last) if last in cfg.profiles else cfg.hub()
+    p = cfg.get(args.profile) if args.profile else active_profile(cfg)
     if args.set is not None:
         ends = None
         if args.expires:
@@ -1080,7 +1132,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "age_s": r.eff.age,
                 "error": r.error,
             })
-        c = picker.best([(r.profile, r.eff) for r in rows], cfg.settings)
+        c = picker.best([(r.profile, r.eff) for r in rows], cfg.settings, prefer=active_profile(cfg).name)
         print(json.dumps({"profiles": out, "next": c.profile.name if c else None,
                           "current": active_profile(cfg).name}, indent=2))
         return 0
@@ -1092,7 +1144,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_pick(args: argparse.Namespace) -> int:
     cfg = Config.load()
     rows = gather(cfg)
-    c = picker.best([(r.profile, r.eff) for r in rows], cfg.settings, exclude=args.exclude or ())
+    c = picker.best([(r.profile, r.eff) for r in rows], cfg.settings, exclude=args.exclude or (),
+                    prefer=active_profile(cfg).name)
     if not c:
         return 1
     print(c.profile.name)
@@ -1501,7 +1554,16 @@ def do_ping(cfg: Config, p: Profile, model: Optional[str], force: bool, schedule
         five = Window(e.five_pct, e.five_resets)
     record_snapshot(p.name, Snapshot(time.time(), "ping", five, Window(e.week_pct, e.week_resets),
                                      p.account_uuid, snap.extra if snap else None))
-    refresh(p, s, live=s.get("live_usage") != "never")  # the ping refreshed the token: get the exact reset
+    if s.get("live_usage") != "never":
+        # The ping refreshed the token: get the exact reset. The usage endpoint takes a few seconds
+        # to count the ping, and a reading taken before that is dropped (record_snapshot), so ask
+        # again until one shows the window.
+        for wait in PING_SETTLE_WAITS:
+            time.sleep(wait)
+            _, err = refresh(p, s, live=True)
+            cur = best_snapshot(p)
+            if err or cur is None or cur.source != "ping":
+                break
     snap2 = best_snapshot(p)
     e2 = effective(snap2)
     _log(f"{p.name}: window open (model {model}, {form} flags, reply '{detail}'), resets {when(e2.five_resets)}")
@@ -1619,13 +1681,26 @@ def cmd_schedule(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- init / doctor
 
-def cas_command() -> str:
+def cas_command(script: Optional[Path] = None) -> str:
     """How Claude Code should call cas (absolute interpreter: the status line may run without your PATH)."""
     python = shutil.which("python3") or sys.executable
-    return f"{shlex.quote(python)} {shlex.quote(str(SCRIPT))}"
+    return f"{shlex.quote(python)} {shlex.quote(str(script or SCRIPT))}"
 
 
-def install_statusline(cfg: Config) -> str:
+def statusline_command() -> str:
+    try:
+        data = read_json_strict(hub_dir() / "settings.json") or {}
+    except Unreadable:
+        return ""
+    sl = data.get("statusLine") if isinstance(data, dict) else None
+    return sl.get("command", "") if isinstance(sl, dict) else ""
+
+
+def is_our_statusline(cmd: str) -> bool:
+    return "bin/cas" in cmd and cmd.rstrip().endswith("statusline")
+
+
+def install_statusline(cfg: Config, script: Optional[Path] = None) -> str:
     path = hub_dir() / "settings.json"
     try:
         data = read_json_strict(path) or {}
@@ -1633,12 +1708,12 @@ def install_statusline(cfg: Config) -> str:
         return f"skipped status line: {path} is not valid JSON"
     if not isinstance(data, dict):
         return f"skipped status line: {path} is not a JSON object"
-    want = f"{cas_command()} statusline"
+    want = f"{cas_command(script)} statusline"
     cur = data.get("statusLine")
     cur_cmd = cur.get("command", "") if isinstance(cur, dict) else ""
     if cur_cmd == want:
         return "status line already installed"
-    ours = "bin/cas" in cur_cmd and cur_cmd.rstrip().endswith("statusline")
+    ours = is_our_statusline(cur_cmd)
     if cur_cmd and not ours:
         cfg.settings["statusline_chain"] = cur_cmd
     if path.exists():
@@ -1665,14 +1740,20 @@ reset (Claude Code asks me to confirm).
 """
 
 
-def install_command() -> str:
+def accounts_command_installed() -> bool:
+    f = hub_dir() / "commands" / "accounts.md"
+    return f.exists() and MARKER in f.read_text(encoding="utf-8", errors="replace")
+
+
+def install_command(script: Optional[Path] = None) -> str:
+    script = script or SCRIPT
     d = hub_dir() / "commands"
     d.mkdir(parents=True, exist_ok=True)
     f = d / "accounts.md"
     if f.exists() and MARKER not in f.read_text(encoding="utf-8", errors="replace"):
         return f"skipped /accounts: {f} exists and isn't ours"
     on_path = shutil.which("cas")
-    cmd = "cas" if on_path and Path(on_path).resolve() == SCRIPT else str(SCRIPT)
+    cmd = "cas" if on_path and Path(on_path).resolve() == script else str(script)
     write_text_atomic(f, ACCOUNTS_MD.format(cmd=cmd, marker=MARKER), 0o644)
     return "/accounts command installed"
 
@@ -1688,6 +1769,119 @@ def link_cli() -> str:
     os.symlink(str(SCRIPT), str(link))
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     return f"linked {link}" + ("" if on_path else f" (add {bindir} to your PATH)")
+
+
+# --------------------------------------------------------------------------- installed copy
+
+INSTALL_MARK = "installed.json"  # in the installed copy: where it came from and when
+
+
+def install_dir() -> Path:
+    """Where `cas install` copies cas, so editing the source folder never changes the cas you use."""
+    return home() / ".local" / "share" / "claude-account-switcher"
+
+
+def source_files(src: Path) -> List[Path]:
+    """What `cas install` copies, relative to the source folder: the program and nothing else."""
+    return sorted(p.relative_to(src) for p in (src / "cas").glob("*.py")) + [Path("bin") / "cas"]
+
+
+def git_version(src: Path) -> Optional[str]:
+    try:
+        head = subprocess.run(["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+        if head.returncode != 0:
+            return None
+        dirty = subprocess.run(["git", "-C", str(src), "status", "--porcelain", "--", "bin", "cas"],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return head.stdout.strip() + (" + uncommitted changes" if dirty.stdout.strip() else "")
+
+
+def install_differs(src: Path, dest: Path) -> List[str]:
+    """Source files the installed copy lacks or has in another version."""
+    out = []
+    for rel in source_files(src):
+        try:
+            if not (dest / rel).is_file() or (src / rel).read_bytes() != (dest / rel).read_bytes():
+                out.append(str(rel))
+        except OSError:
+            out.append(str(rel))
+    return out
+
+
+def point_link(target: Path) -> str:
+    link = home() / ".local" / "bin" / "cas"
+    if link.is_symlink() and Path(os.path.realpath(link)) == target:
+        return f"{link} already points to the installed copy"
+    if link.exists() and not link.is_symlink():
+        return f"skipped: {link} exists and isn't a link"
+    if link.is_symlink() and Path(os.path.realpath(link)).name != "cas":
+        return f"skipped: {link} points to something else"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    tmp = link.with_name(".cas.tmp")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    os.symlink(str(target), str(tmp))
+    os.replace(tmp, link)  # never a moment without `cas`
+    return f"{link} → installed copy"
+
+
+def repoint_setup(cfg: Config, script: Path) -> List[str]:
+    """Point what cas set up (the `cas` link, status line, /accounts, scheduled pings) at `script`.
+    Pieces you chose not to have (cas init --no-statusline, ...) stay out."""
+    steps = [point_link(script)]
+    if is_our_statusline(statusline_command()):
+        steps.append(install_statusline(cfg, script))
+    if accounts_command_installed():
+        steps.append(install_command(script))
+    if launchd.supported():
+        try:
+            moved = launchd.repoint(str(script))
+        except (OSError, RuntimeError) as e:
+            steps.append(f"scheduled pings not moved: {e}")
+        else:
+            if moved:
+                steps.append(f"scheduled pings of {', '.join(moved)} → installed copy")
+    return steps
+
+
+def cmd_install(_args: argparse.Namespace) -> int:
+    dest = install_dir()
+    src = SCRIPT.parent.parent
+    if src == dest.resolve():
+        # This is the installed copy: install again from the folder it came from, with that folder's
+        # own installer (it may be newer than this copy's).
+        mark = read_json(dest / INSTALL_MARK, {}) or {}
+        origin = Path(str(mark.get("source") or ""))
+        if not mark.get("source") or not (origin / "bin" / "cas").is_file():
+            return die("this is the installed copy and the folder it came from is gone; "
+                       "run `<source folder>/bin/cas install`")
+        return subprocess.call([shutil.which("python3") or sys.executable, str(origin / "bin" / "cas"), "install"])
+    files = source_files(src)
+    try:
+        for rel in files:  # each file replaced whole, so none is ever half-written; the entry point last
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_name(f".{out.name}.tmp")
+            shutil.copyfile(src / rel, tmp)  # not copy2: a new mtime makes Python recompile it
+            os.chmod(tmp, 0o755 if rel.parts[0] == "bin" else 0o644)
+            os.replace(tmp, out)
+        for old in (dest / "cas").glob("*.py"):
+            if Path("cas") / old.name not in files:
+                old.unlink()  # gone from the source
+    except OSError as e:
+        return die(f"could not install into {dest}: {e}")
+    version = git_version(src)
+    write_json_atomic(dest / INSTALL_MARK, {"source": str(src), "version": version, "installed_at": time.time()},
+                      0o644)
+    print(f"✓ installed {version or 'cas ' + __version__} from {src} into {dest}")
+    for s in repoint_setup(Config.load(), (dest / "bin" / "cas").resolve()):
+        print(f"· {s}")
+    print("Edits to the source folder no longer change the cas you use. To update, run `cas install` again "
+          "(on each machine).")
+    return 0
 
 
 SHELL_BEGIN = "# >>> claude-account-switcher >>>"
@@ -1821,9 +2015,13 @@ def uninstall(args: argparse.Namespace) -> int:
     for s in remove_shell_hook():
         print(f"· {s} (plain `claude` is back on ~/.claude in new terminals)")
     link = home() / ".local" / "bin" / "cas"
-    if link.is_symlink() and Path(os.path.realpath(link)) == SCRIPT:
+    installed_script = (install_dir() / "bin" / "cas").resolve()
+    if link.is_symlink() and Path(os.path.realpath(link)) in (SCRIPT, installed_script):
         link.unlink()
         print(f"· {link} removed")
+    if install_dir().is_dir():
+        shutil.rmtree(install_dir(), ignore_errors=True)
+        print(f"· installed copy removed ({install_dir()})")
     print(f"Profiles and logins are kept in {cas_home()}; `cas remove <name> --purge` deletes one.")
     return 0
 
@@ -1841,6 +2039,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"{bad} claude not found")
         problems += 1
     print(f"{ok} python: {sys.executable} ({sys.version.split()[0]})")
+    dest = install_dir()
+    if SCRIPT.parent.parent == dest.resolve():
+        mark = read_json(dest / INSTALL_MARK, {}) or {}
+        origin = Path(str(mark.get("source") or ""))
+        stale = install_differs(origin, dest) if mark.get("source") and (origin / "cas").is_dir() else []
+        at = when(float(mark.get("installed_at") or 0) or None)
+        print(f"{style.warn('!') if stale else ok} cas: installed copy of {mark.get('version') or '?'} ({at}) "
+              f"from {origin}" + (f"; the source changed since ({len(stale)} files) → cas install" if stale else ""))
+    else:
+        print(f"{ok} cas: running from the source folder {SCRIPT.parent.parent}" +
+              ("; `cas` on PATH may be the installed copy" if dest.is_dir() else
+               "; `cas install` copies it out, so edits here don't change the cas you use"))
     on_path = shutil.which("cas")
     print(f"{ok if on_path else bad} cas on PATH: {on_path or 'no (run cas init)'}")
     try:
@@ -1939,6 +2149,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-shell", action="store_true", help="leave plain `claude` on ~/.claude (no shell function)")
     s.set_defaults(fn=cmd_init)
 
+    s = sub.add_parser("install", help="run cas from a copy, so edits to its source don't change it (again to update)")
+    s.set_defaults(fn=cmd_install)
+
     s = sub.add_parser("add", help="create a profile for another account and log in")
     s.add_argument("name")
     s.add_argument("--email", help="prefill the login page")
@@ -2002,6 +2215,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("claude", help="start Claude Code on the current account (what plain `claude` runs after init)")
 
+    s = sub.add_parser("use", help="make an account the current one, where fresh sessions start (all machines)")
+    s.add_argument("profile")
+    s.set_defaults(fn=cmd_use)
+
     s = sub.add_parser("env", help="print shell exports to use a profile with plain `claude`")
     s.add_argument("profile", nargs="?", help="default: the current account")
     s.set_defaults(fn=cmd_env)
@@ -2063,6 +2280,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_run(argv[1:])
     if argv and argv[0] == "claude":
         return cmd_claude(argv[1:])
+    if argv and argv[0] == REFRESH_CMD:
+        return cmd_refresh(argv[1:])
     ap = build_parser()
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):

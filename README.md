@@ -22,6 +22,12 @@ cas add work              # new profile; a browser login opens: sign in with the
 cas status
 ```
 
+**Run it from an installed copy** (recommended when the source folder is synced or you edit it):
+`cas install` copies the program to `~/.local/share/claude-account-switcher` and points the `cas`
+command, the status line, `/accounts` and scheduled pings at that copy. Edits to the source folder
+then change nothing until you run `cas install` again, on each machine; run from the installed copy,
+it installs again from the folder it came from. `cas doctor` says when the source has changed since.
+
 Your existing `~/.claude` login becomes the profile `default`. To give it another name, run
 `cas init --name personal`. If your browser is already signed in to a different Claude account,
 open the login URL in a private window.
@@ -33,14 +39,17 @@ open the login URL in a private window.
 | `cas status` | What's left on every account, and which one to use next |
 | `cas run` | Start Claude Code on the best account (`cas run work` picks one). Other arguments go to `claude` unchanged: `cas run -c`, `cas run work --model opus` |
 | `cas handoff [name]` | Resume this directory's last conversation on another account |
+| `cas use work` | Make `work` the current account: a fresh `claude` starts there, on all your machines with `cas share` |
 | `cas reset [name]` | Use a limit reset (see below) |
 | `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account; `cas env` alone gives the current account |
 | `cas rename old new` | Rename a profile; its login is kept (names may contain dots, e.g. `gmail.com`) |
 | `cas share --store …` | Share memory with your other machines through a synced folder (see below) |
 | `cas doctor` / `cas sync` | Check the setup / repair shared links, files and stale logins |
+| `cas install` | Run cas from a copy outside the source folder; run it again to update (see Setup) |
 
 **Plain `claude`** starts on the current account: the one cas last started or handed off to
-(`cas status` names it). For that, `cas init` adds a small `claude` shell function to `~/.zshrc`
+(`cas status` names it), on any of your machines when `cas share` is on, since limits belong to
+the account and not the machine. For that, `cas init` adds a small `claude` shell function to `~/.zshrc`
 (and `~/.bashrc` if you have one), which runs `cas claude`; `cas init --no-shell` leaves plain
 `claude` on `~/.claude`. It prepares the profile like `cas run` does, but it doesn't pick the best
 account or offer a handoff at the limit: that needs `cas run`, because a running Claude Code
@@ -166,7 +175,9 @@ cas share --off
 
 Shared through that folder: the user `CLAUDE.md`, the auto-memory of your projects, `agents/`,
 `commands/` and your skills. Not shared: `skills/synced`, which is Claude Code's own per-account
-sync of claude.ai skills.
+sync of claude.ai skills. cas also shares its own records there: the limit resets you have, and
+the current account (when `cas run` or a handoff moves to another account on one machine, a fresh
+`claude` on the other starts there too; it's matched by account, so profile names can differ).
 
 - **Project memory.** Claude Code keys memory by the project's full path, and that path differs
   between machines (`/Users/alice/code/X` vs `/Users/bob/code/X`). cas maps both to
@@ -236,7 +247,8 @@ Freshest source wins, and every number shows its source and age:
 3. **live**: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, the endpoint `/usage`
    uses, called with that profile's own OAuth token. The token is read from the Keychain at call
    time, sent only to api.anthropic.com, and never printed or stored. It runs when cached data is
-   older than `live_max_age_s`; set `live_usage` to `never` to turn it off. Expired tokens are not
+   older than `live_max_age_s`, including in the background each time `cas run` or `claude` starts
+   a session, so the status line's `next:` is current; set `live_usage` to `never` to turn it off. Expired tokens are not
    refreshed by `cas`; Claude Code refreshes them the next time it runs on that account.
 
 A window whose reset time has passed counts as 0% used, so an account idle for 5+ hours shows as

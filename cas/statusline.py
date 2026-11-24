@@ -46,7 +46,7 @@ def _left_color(left: float) -> str:
 
 
 def _hm(ts: Optional[float]) -> str:
-    return time.strftime("%H:%M", time.localtime(ts)) if ts else ""
+    return time.strftime("%H:%M", time.localtime(ts + 30)) if ts else ""  # to the nearest minute
 
 
 def _record(p: Profile, data: Dict[str, Any], now: float) -> None:

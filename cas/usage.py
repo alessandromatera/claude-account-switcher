@@ -182,20 +182,28 @@ def update_state(name: str, **kv: Any) -> Dict[str, Any]:
 
 
 RESET_DEBOUNCE_S = 600  # one reset can show up as several drops while readings settle
+PING_SETTLE_S = 120  # the usage endpoint takes a few seconds to count the window a ping opened
 
 
-def record_snapshot(name: str, snap: Snapshot) -> None:
+def record_snapshot(name: str, snap: Snapshot) -> bool:
+    """Keep `snap` as this account's latest reading, unless it is older or stale. True if kept."""
     st = load_state(name)
     old = Snapshot.from_dict(st["usage"]) if isinstance(st.get("usage"), dict) else None
     if old is not None and old.fetched_at > snap.fetched_at:
-        return
+        return False
     cleared = [float(w) for w in st.get("reset_windows") or []]
     r = snap.five_hour.resets_at
     if r is not None and r > snap.fetched_at and any(abs(r - w) < 120 for w in cleared):
         # Still describes the window a reset cleared: a stale reading (the status line repeats
         # Claude Code's last response headers until its next request). Recording it would flip
         # usage back up and make the next fresh reading look like another reset.
-        return
+        return False
+    if (old is not None and old.source == "ping" and r is None and old.five_hour.resets_at is not None
+            and old.five_hour.resets_at > snap.fetched_at and snap.fetched_at - old.fetched_at < PING_SETTLE_S):
+        # Taken before the usage endpoint counted the ping that just opened a window: it shows no
+        # 5-hour window yet. Recording it would replace the window the ping opened with "5h: ?"
+        # until something fetched again.
+        return False
     if snap.extra is None and old is not None and old.extra is not None:
         snap.extra = old.extra  # the status line doesn't carry credits; keep the last known
     used = old is not None and reset_used(old, snap)
@@ -211,6 +219,7 @@ def record_snapshot(name: str, snap: Snapshot) -> None:
         from . import resetlog  # the reset happened between these two readings
 
         resetlog.note_use(snap.account_uuid or old.account_uuid, old.fetched_at, snap.fetched_at)
+    return True
 
 
 def reset_used(old: Snapshot, new: Snapshot) -> bool:
@@ -351,7 +360,8 @@ def fetch_live(profile: Profile, timeout: float = 8.0) -> Tuple[Optional[Snapsho
     snap = snapshot_from_api(data, "live", now, profile.account_uuid)
     if snap is None:
         return None, "usage endpoint returned no plan limits"
-    record_snapshot(profile.name, snap)
+    if not record_snapshot(profile.name, snap):
+        snap = best_snapshot(profile) or snap  # the reading was stale: hand back what was kept
     if asked_resets and isinstance(data, dict) and "cedar_ember" in data:
         from . import resets  # local import: resets depends on this module
 
@@ -364,15 +374,21 @@ def fetch_live(profile: Profile, timeout: float = 8.0) -> Tuple[Optional[Snapsho
     return snap, None
 
 
+def live_due(snap: Optional[Snapshot], settings: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """Whether `live_usage` says to fetch live data, given the best reading cas has."""
+    mode = settings.get("live_usage", "auto")
+    now = time.time() if now is None else now
+    return mode == "always" or (
+        mode == "auto" and (snap is None or now - snap.fetched_at > settings.get("live_max_age_s", 300))
+    )
+
+
 def refresh(profile: Profile, settings: Dict[str, Any], live: Optional[bool] = None
             ) -> Tuple[Optional[Snapshot], Optional[str]]:
     """Best snapshot, fetching live data when settings (or `live`) say so."""
     snap = best_snapshot(profile)
-    mode = settings.get("live_usage", "auto")
     if live is None:
-        live = mode == "always" or (
-            mode == "auto" and (snap is None or time.time() - snap.fetched_at > settings.get("live_max_age_s", 300))
-        )
+        live = live_due(snap, settings)
     if not live or not profile.logged_in():
         return snap, None
     fresh, err = fetch_live(profile)

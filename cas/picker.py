@@ -2,7 +2,8 @@
 
 Rule: spend the quota that expires soonest. An account whose 5-hour window is already open
 loses whatever it doesn't use at reset, so it goes first (soonest reset first) as long as it
-has real headroom left. Accounts with no open window keep their quota until you start them,
+has real headroom left. Windows that reset in the same minute are a tie (readings differ by
+fractions of a second), and a tie keeps the account you're on, so your machines settle on one. Accounts with no open window keep their quota until you start them,
 so they come next, lowest weekly usage first. Accounts over the thresholds are skipped.
 """
 
@@ -38,11 +39,11 @@ class Blocked:
 
 
 def _hhmm(ts: Optional[float]) -> str:
-    return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
+    return time.strftime("%H:%M", time.localtime(ts + 30)) if ts else "?"  # to the nearest minute
 
 
 def rank(items: Sequence[Tuple[Profile, Effective]], settings: Dict[str, Any],
-         exclude: Iterable[str] = ()) -> Tuple[List[Choice], List[Blocked]]:
+         exclude: Iterable[str] = (), prefer: Optional[str] = None) -> Tuple[List[Choice], List[Blocked]]:
     thr = float(settings.get("switch_threshold", 90))
     wthr = float(settings.get("weekly_threshold", 97))
     min_head = float(settings.get("min_headroom", 15))
@@ -64,12 +65,13 @@ def rank(items: Sequence[Tuple[Profile, Effective]], settings: Dict[str, Any],
             continue
 
         week = e.week_pct if e.week_pct is not None else 50.0
+        stay = 0 if p.name == prefer else 1
         if e.window == "active" and e.five_pct is not None and (thr - e.five_pct) >= min_head:
-            key = (TIER_OPEN, e.five_resets or float("inf"), week, order)
+            key = (TIER_OPEN, round(e.five_resets / 60) if e.five_resets else float("inf"), stay, week, order)
             reason = f"open window, {100 - e.five_pct:.0f}% left, resets {_hhmm(e.five_resets)}"
             tier = TIER_OPEN
         elif e.window == "idle":
-            key = (TIER_IDLE, week, order)
+            key = (TIER_IDLE, week, stay, order)
             reason = "no open window" + (f", weekly {e.week_pct:.0f}%" if e.week_pct is not None else "")
             tier = TIER_IDLE
         elif e.window == "unknown":
@@ -88,8 +90,8 @@ def rank(items: Sequence[Tuple[Profile, Effective]], settings: Dict[str, Any],
 
 
 def best(items: Sequence[Tuple[Profile, Effective]], settings: Dict[str, Any],
-         exclude: Iterable[str] = ()) -> Optional[Choice]:
-    ordered, _ = rank(items, settings, exclude)
+         exclude: Iterable[str] = (), prefer: Optional[str] = None) -> Optional[Choice]:
+    ordered, _ = rank(items, settings, exclude, prefer)
     return ordered[0] if ordered else None
 
 

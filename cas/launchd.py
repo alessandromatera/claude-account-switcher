@@ -101,6 +101,29 @@ def rename(old: str, new: str) -> bool:
     return True
 
 
+def repoint(script: str) -> List[str]:
+    """Make every installed schedule run `script` (`cas install` moved cas). Returns the profiles changed."""
+    changed = []
+    domain = f"gui/{os.getuid()}"
+    for name in installed():
+        path = plist_path(name)
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+        args = list(data.get("ProgramArguments") or [])
+        if len(args) < 2 or args[1] == script:
+            continue
+        args[1] = script
+        data["ProgramArguments"] = args
+        _launchctl("bootout", domain, str(path))
+        with open(path, "wb") as f:
+            plistlib.dump(data, f)
+        r = _launchctl("bootstrap", domain, str(path))
+        if r.returncode != 0:
+            raise RuntimeError(f"launchctl bootstrap failed for {path.name}: {r.stderr.strip() or r.stdout.strip()}")
+        changed.append(name)
+    return changed
+
+
 def remove(profile: str) -> bool:
     path = plist_path(profile)
     if not path.exists():

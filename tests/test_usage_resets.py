@@ -165,6 +165,20 @@ class SourcesTest(IsolatedHome):
         self.assertEqual(resets.best_status(hub).count(), 3)
         self.assertEqual(usage.best_snapshot(hub).seven_day.pct, 1, "stale readings are not recorded")
 
+    def test_reading_before_the_endpoint_counted_a_ping_is_dropped(self):
+        hub = Config.load().hub()
+        t = time.time()
+        week = usage.Window(50, t + 4 * 86400)
+        self.assertTrue(usage.record_snapshot(hub.name, usage.Snapshot(t, "ping", usage.Window(0, t + 5 * 3600),
+                                                                       week, "acct-hub")))
+        early = usage.Snapshot(t + 4, "live", usage.Window(None, None), week, "acct-hub")
+        self.assertFalse(usage.record_snapshot(hub.name, early))
+        self.assertEqual(usage.effective(usage.best_snapshot(hub), t + 5).window, "active", "not 5h: ?")
+        # long after the ping, a reading with no window is the truth (the ping didn't count)
+        late = usage.Snapshot(t + usage.PING_SETTLE_S + 1, "live", usage.Window(None, None), week, "acct-hub")
+        self.assertTrue(usage.record_snapshot(hub.name, late))
+        self.assertEqual(usage.best_snapshot(hub).source, "live")
+
     def test_weekly_only_reset_with_same_window_counts_once(self):
         hub = Config.load().hub()
         resets.set_manual(hub, 2, "weekly")

@@ -32,6 +32,20 @@ class PickerTest(unittest.TestCase):
         items = [(Profile("fresh"), idle()), (Profile("late"), active(30, 4)), (Profile("soon"), active(50, 1))]
         self.assertEqual(self.names(items)[0], ["soon", "late", "fresh"])
 
+    def test_same_minute_resets_tie_and_a_tie_keeps_the_current_account(self):
+        """Regression: two windows both resetting at 14:00 were ordered by fractions of a second
+        (13:59:59.81 vs 14:00:00.00), so `cas run` flipped between accounts on reading noise."""
+        at = (int(NOW // 3600) + 2) * 3600.0
+        a = Effective(five_pct=0.0, five_resets=at - 0.19, week_pct=50.0, window="active")
+        b = Effective(five_pct=32.0, five_resets=at, week_pct=48.0, window="active")
+        items = [(Profile("gmail"), a), (Profile("work"), b)]
+        self.assertEqual(self.names(items)[0], ["work", "gmail"], "a tie: lower weekly usage first")
+        self.assertEqual(self.names(items, prefer="gmail")[0], ["gmail", "work"], "a tie keeps the current one")
+        self.assertEqual(self.names(items, prefer="work")[0], ["work", "gmail"])
+        a.five_resets = at - 600  # really sooner: the rule wins over staying
+        self.assertEqual(self.names(items, prefer="work")[0], ["gmail", "work"])
+        self.assertEqual(picker._hhmm(at - 0.19), picker._hhmm(at), "shown as the same minute")
+
     def test_thresholds_block(self):
         items = [(Profile("full"), active(95, 1)), (Profile("weekly"), active(10, 3, week=99)),
                  (Profile("nologin"), idle()), (Profile("ok"), idle())]
