@@ -77,6 +77,13 @@ class CliTest(IsolatedHome):
         st = usage.load_state("work")
         self.assertEqual(st["last_session"]["id"], "sess-1")
         self.assertEqual(st["usage"]["five_hour"]["pct"], 42)
+        # the other accounts' usage is kept current during the session, not this one's (it comes on stdin)
+        self.assertEqual(statusline.refresh_others.call_args[0][1].name, "work")
+        # a number that stayed old anyway (e.g. the fetch failed) says so
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now - 1800, "live", usage.Window(8, now + 3600),
+                                                         usage.Window(50, now + 86400), "acct-hub"))
+        self.assertIn("next: default 92% (30m old)", statusline.render(cfg, p, now, color=False))
         # garbage input never raises
         self.assertIn("default", statusline.main("not json", cfg, {}))
 
@@ -660,6 +667,8 @@ class CliTest(IsolatedHome):
             self.assertEqual(cli.refresh_in_background(cfg, now=now), ["work"])
             self.assertEqual(popen.call_args[0][0][-2:], [cli.REFRESH_CMD, "work"])
             self.assertTrue(popen.call_args[1]["start_new_session"])
+            self.assertEqual(cli.refresh_in_background(cfg, now=now + 30), [],
+                             "the status line asks on every refresh: one fetch per live_max_age_s, even if it failed")
             self.assertEqual(cli.refresh_in_background(cfg, skip=["work"], now=now), [], "a ping refreshes it")
             self.assertEqual(cli.refresh_in_background(cfg, now=now + 3600), ["default", "work"])
             cfg.settings["live_usage"] = "never"

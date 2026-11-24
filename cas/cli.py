@@ -699,16 +699,21 @@ def prime_others(cfg: Config, target: Profile, style: Style, now: Optional[float
 
 
 def refresh_in_background(cfg: Config, skip: Sequence[str] = (), now: Optional[float] = None) -> List[str]:
-    """Bring out-of-date usage up to date without delaying the start (`live_usage` decides what is).
+    """Bring out-of-date usage up to date without waiting for it (`live_usage` decides what is).
 
-    The status line only reads what cas has recorded, so without this its `next:` would show "?"
-    or an old percentage for the whole session. An account in `skip` gets its own refresh (a ping).
+    Runs when a session starts and from the status line during it: the status line only reads what
+    cas has recorded, so its `next:` would otherwise show "?" or a percentage from long ago. An
+    account is fetched at most once per `live_max_age_s`, even when its fetch fails.
     """
     now = time.time() if now is None else now
+    gap = float(cfg.settings.get("live_max_age_s", 300))
+    spawned = load_state("_refresh")
     due = [q.name for q in cfg.profile_list() if q.enabled and q.logged_in() and q.name not in skip
-           and live_due(best_snapshot(q), cfg.settings, now)]
+           and live_due(best_snapshot(q), cfg.settings, now) and now - float(spawned.get(q.name) or 0) >= gap]
     if not due:
         return []
+    spawned.update({n: now for n in due})
+    save_state("_refresh", spawned)
     log = cas_home() / "logs" / "refresh.log"
     try:
         log.parent.mkdir(parents=True, exist_ok=True)

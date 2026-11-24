@@ -3,7 +3,8 @@
 Claude Code runs it on every refresh and passes a JSON blob on stdin that includes
 rate_limits.five_hour / seven_day for the account the session runs on. cas records that (so
 every other cas command knows this account's live usage for free), remembers the session id
-(so `cas handoff` can resume it on another account), and prints one line:
+(so `cas handoff` can resume it on another account), fetches the other accounts' usage in the
+background when it's out of date (it shows on a later refresh), and prints one line:
 
     work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%
 
@@ -47,6 +48,17 @@ def _left_color(left: float) -> str:
 
 def _hm(ts: Optional[float]) -> str:
     return time.strftime("%H:%M", time.localtime(ts + 30)) if ts else ""  # to the nearest minute
+
+
+def _old(sec: float) -> str:
+    return f"{int(sec // 60)}m old" if sec < 5400 else f"{int(sec // 3600)}h old"
+
+
+def refresh_others(cfg: Config, p: Profile) -> None:
+    """Keep the other accounts' usage current during the session (this one's comes on stdin)."""
+    from .cli import refresh_in_background  # cli imports this module lazily: no cycle
+
+    refresh_in_background(cfg, skip=[p.name])
 
 
 def _record(p: Profile, data: Dict[str, Any], now: float) -> None:
@@ -162,7 +174,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         line += " │ " + c("33", f"⚠ opened outside cas, which is on {outside.name} → exit, then: {fix}")
     elif alt:
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
-        line += c("2", f" │ next: {alt.profile.name} {left}")
+        old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
+        line += c("2", f" │ next: {alt.profile.name} {left}" + (f" ({_old(alt.eff.age)})" if old else ""))
     if keychain_locked:
         line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")
     return line
@@ -200,6 +213,11 @@ def main(raw: str, cfg: Optional[Config] = None, env: Optional[Dict[str, str]] =
     except OSError:
         outside, fix = None, ""
     ours = render(cfg, p, now, keychain_locked=locked, outside=outside, fix=fix)
+    if p is not None:
+        try:
+            refresh_others(cfg, p)  # shows on a later refresh, once the fetch is back
+        except Exception:
+            pass  # a status line must never break over this
     chain = cfg.settings.get("statusline_chain")
     if chain:
         before = run_chain(chain, raw)

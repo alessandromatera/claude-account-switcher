@@ -21,6 +21,10 @@ class IsolatedHome(unittest.TestCase):
         kc = mock.patch("cas.keychain.supported", return_value=False)
         kc.start()
         self.addCleanup(kc.stop)
+        # Never spawn real background usage fetches from the status line.
+        bg = mock.patch("cas.statusline.refresh_others")
+        bg.start()
+        self.addCleanup(bg.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self._env = {k: os.environ.get(k) for k in
