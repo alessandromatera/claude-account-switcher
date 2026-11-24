@@ -67,7 +67,7 @@ than cas's, its status line says so and gives the fix:
 
 **Inside Claude Code:**
 - The status line shows the current account, what's left and when it resets, plus the next account:
-  `work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100% · wk 41%`.
+  `work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 5h 100% · wk 41%`.
   When no other account has room, it shows the one that frees up first, with when it resets, its week, and
   `⟲` if a limit reset could free it now: `│ personal 5h 0% ↻15:10 · wk 41% · ⟲`. It shows that too
   once this account is at its limit.

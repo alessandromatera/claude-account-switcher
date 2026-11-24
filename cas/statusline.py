@@ -6,7 +6,7 @@ every other cas command knows this account's live usage for free), remembers the
 (so `cas handoff` can resume it on another account), fetches the other accounts' usage in the
 background when it's out of date (it shows on a later refresh), and prints one line:
 
-    work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100% · wk 41%
+    work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 5h 100% · wk 41%
 
 When no other account has room, it shows the one that frees up first instead of `next:`, also
 at this account's limit:
@@ -252,7 +252,7 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
                           (f" → let {them} finish, then exit and `cas handoff` → {alt.profile.name}" if alt
                            else ", no other account has room"))
     elif alt:
-        left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
+        left = "5h ?" if alt.eff.five_pct is None else f"5h {max(0.0, 100 - alt.eff.five_pct):.0f}%"
         old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
         wk = _week(alt.eff, c)
         line += c("2", f" │ next: {alt.profile.name} {left}") + (c("2", " · ") + wk if wk else "") + \

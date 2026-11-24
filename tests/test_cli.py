@@ -83,7 +83,7 @@ class CliTest(IsolatedHome):
         now = time.time()
         usage.record_snapshot("default", usage.Snapshot(now - 1800, "live", usage.Window(8, now + 3600),
                                                          usage.Window(50, now + 86400), "acct-hub"))
-        self.assertIn("next: default 92% · wk 50% (30m old)", statusline.render(cfg, p, now, color=False))
+        self.assertIn("next: default 5h 92% · wk 50% (30m old)", statusline.render(cfg, p, now, color=False))
         # garbage input never raises
         self.assertIn("default", statusline.main("not json", cfg, {}))
 
