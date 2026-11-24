@@ -71,8 +71,10 @@ than cas's, its status line says so and gives the fix:
   When no other account has room, it shows the one that frees up first, with when it resets, its week, and
   `⟲` if a limit reset could free it now: `│ personal 5h 0% ↻15:10 · wk 41% · ⟲`. It shows that too
   once this account is at its limit.
-  At the limit it tells you what to do next. Near it, while this conversation's agents are at work,
-  it says so: `⚠ 2 agents running, limit near → let them finish, then exit and cas handoff → personal`
+  At the limit it tells you what to do next, with what's left on the account to switch to:
+  `│ limit: exit, then cas handoff → personal 5h 100% · wk 41%`. Near it, while this conversation's
+  agents are at work, it says so:
+  `⚠ 2 agents running, limit near → let them finish, then exit and cas handoff → personal 5h 100% · wk 41%`
   (see [Agents](#agents)).
 - `/accounts` summarizes all accounts. `! cas status` shows the same table without a model call.
 
@@ -118,7 +120,7 @@ session can't change account, so no handoff can carry a running agent over. What
 - **Warn first.** From `agent_warning` points before `switch_threshold` (default 15, so from 75%
   of the 5-hour window used), the status line warns while agents are at work. Switching once they
   are done interrupts nothing. At the limit it counts the ones that stopped:
-  `limit: exit, then cas handoff → personal, which continues the 2 agents`.
+  `limit: exit, then cas handoff → personal 5h 100% · wk 41%, which continues the 2 agents`.
 
 ## Logins over SSH (macOS Keychain)
 

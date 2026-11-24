@@ -14,6 +14,10 @@ at this account's limit:
     work 5h 58% left ↻14:20 · wk 76% │ personal 5h 0% ↻15:10 · wk 41% · ⟲
     work 5h 8% left ↻14:20 · wk 76% · ⟲1 │ limit reset available: /limit-reset │ personal 5h 0% ↻15:10 · wk 41%
 
+At the limit it says to hand off, and what's left on the account it hands off to:
+
+    work 5h 7% left ↻14:20 · wk 19% │ limit: exit, then `cas handoff` → personal 5h 100% · wk 41%
+
 Near the limit, while this conversation's agents are at work, it says so: they stop when the
 account does, so switching once they're done interrupts nothing. At the limit it says how many
 stopped; `cas handoff` has Claude continue them on the next account.
@@ -72,6 +76,17 @@ def _week(e: Any, c: Any) -> Optional[str]:
 
 def _old(sec: float) -> str:
     return f"{int(sec // 60)}m old" if sec < 5400 else f"{int(sec // 3600)}h old"
+
+
+def _room(cfg: Config, e: Any, c: Any) -> str:
+    """What's left on an account with room, after its name: ` 5h 100% · wk 41%`, dim."""
+    out = c("2", " 5h ?" if e.five_pct is None else f" 5h {max(0.0, 100 - e.five_pct):.0f}%")
+    wk = _week(e, c)
+    if wk:
+        out += c("2", " · ") + wk
+    if e.age is not None and e.age > 2 * float(cfg.settings.get("live_max_age_s", 300)):
+        out += c("2", f" ({_old(e.age)})")
+    return out
 
 
 def refresh_others(cfg: Config, p: Profile) -> None:
@@ -235,8 +250,9 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         if alt:
             stopped = subagents.cut_off(agents, now - subagents.HANDOFF_WINDOW_S) \
                 if cfg.settings.get("resume_agents", True) else []
-            line += " │ " + c("33", f"limit: exit, then `cas handoff` → {alt.profile.name}" +
-                              (f", which continues the {_agents(len(stopped))}" if stopped else ""))
+            line += " │ " + c("33", f"limit: exit, then `cas handoff` → {alt.profile.name}") + \
+                _room(cfg, alt.eff, c) + \
+                (c("33", f", which continues the {_agents(len(stopped))}") if stopped else "")
         elif n or (rs and rs.has_any(now)):
             line += " │ " + c("36", "limit reset available: /limit-reset")
         elif other:  # it shows when the other one resets
@@ -250,13 +266,9 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         them = "them" if len(running) != 1 else "it"
         line += " │ " + c("33", f"⚠ {_agents(len(running))} running, limit near" +
                           (f" → let {them} finish, then exit and `cas handoff` → {alt.profile.name}" if alt
-                           else ", no other account has room"))
+                           else ", no other account has room")) + (_room(cfg, alt.eff, c) if alt else "")
     elif alt:
-        left = "5h ?" if alt.eff.five_pct is None else f"5h {max(0.0, 100 - alt.eff.five_pct):.0f}%"
-        old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
-        wk = _week(alt.eff, c)
-        line += c("2", f" │ next: {alt.profile.name} {left}") + (c("2", " · ") + wk if wk else "") + \
-            (c("2", f" ({_old(alt.eff.age)})") if old else "")
+        line += c("2", f" │ next: {alt.profile.name}") + _room(cfg, alt.eff, c)
     line += other
     if keychain_locked:
         line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")

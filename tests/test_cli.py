@@ -2,6 +2,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -451,11 +452,12 @@ class CliTest(IsolatedHome):
         def line(pct):
             payload = {"session_id": "s1", "transcript_path": str(t),
                        "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": int(now) + 3600}}}
-            return statusline.main(json.dumps(payload), cfg, p.env({}))
+            return re.sub(r"\x1b\[[0-9;]*m", "", statusline.main(json.dumps(payload), cfg, p.env({})))
 
         self.assertIn("next: default", line(50))  # far from the limit: no warning
         out = line(80)
-        self.assertIn("⚠ 2 agents running, limit near → let them finish, then exit and `cas handoff` → default", out)
+        self.assertIn("⚠ 2 agents running, limit near → let them finish, then exit and `cas handoff` → default"
+                      " 5h 90% · wk 70%", out)
         self.assertNotIn("next:", out)
         cfg.settings["agent_warning"] = 0
         self.assertNotIn("agents running", line(80))
@@ -463,9 +465,11 @@ class CliTest(IsolatedHome):
 
         # at the limit the agents stop too; the handoff continues them
         write_agent(t, "a2", AGENT_LIMIT, True, now)
-        self.assertIn("limit: exit, then `cas handoff` → default, which continues the 2 agents", line(100))
+        self.assertIn("limit: exit, then `cas handoff` → default 5h 90% · wk 70%, which continues the 2 agents",
+                      line(100))
         cfg.settings["resume_agents"] = False
         self.assertNotIn("continues", line(100))
+        self.assertIn("limit: exit, then `cas handoff` → default 5h 90% · wk 70%", line(100))
 
     def test_run_loop_reset_path_asks_and_offers_once(self):
         """No other account has room: the user picks the reset; it opens /limit-reset; never offered twice."""
