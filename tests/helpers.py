@@ -59,3 +59,36 @@ class IsolatedHome(unittest.TestCase):
     @staticmethod
     def read_json(path):
         return json.loads(Path(path).read_text())
+
+
+# Last messages of a subagent, as Claude Code writes them (see cas/agents.py).
+AGENT_LIMIT = {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+               "message": {"content": [{"type": "text", "text": "You've hit your 5-hour limit · resets 3:30pm"}]}}
+AGENT_INTERRUPTED = {"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}
+AGENT_WORKING = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                                                               "input": {"command": "make"}}]}}
+AGENT_DONE = {"type": "assistant", "message": {"content": [{"type": "text", "text": "All done."}]}}
+
+
+def iso(ts):
+    import datetime
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat()
+
+
+def write_agent(transcript, aid, last, finished, at, depth=1, description=None):
+    """One subagent of the conversation whose transcript is `transcript`, last active at `at`."""
+    from cas import agents
+
+    d = agents.subagents_dir(Path(transcript))
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"agentType": "general-purpose", "isBuiltIn": True, "description": description or f"task {aid}",
+            "toolUseId": f"toolu_{aid}", "spawnDepth": depth, "requestShape": "background"}
+    if finished:
+        meta["finished"] = True
+    (d / f"agent-{aid}.meta.json").write_text(json.dumps(meta))
+    entries = [{"type": "user", "agentId": aid, "timestamp": iso(at - 60), "message": {"content": "do the task"}},
+               dict(last, agentId=aid, timestamp=iso(at))]
+    path = d / f"agent-{aid}.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    os.utime(path, (at, at))
+    return path

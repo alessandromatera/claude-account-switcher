@@ -68,7 +68,9 @@ than cas's, its status line says so and gives the fix:
 **Inside Claude Code:**
 - The status line shows the current account, what's left and when it resets, plus the next account:
   `work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%`.
-  At the limit it tells you what to do next.
+  At the limit it tells you what to do next. Near it, while this conversation's agents are at work,
+  it says so: `⚠ 2 agents running, limit near → let them finish, then exit and cas handoff → personal`
+  (see [Agents](#agents)).
 - `/accounts` summarizes all accounts. `! cas status` shows the same table without a model call.
 
 **Picking an account.** `cas` uses the quota that expires soonest first. An account whose 5-hour
@@ -93,6 +95,27 @@ handoff resumes exactly that one, even with other sessions open in the same fold
 `cas handoff` (run after exiting) lists the conversations used in this folder in the last 6 hours
 with their first prompt, asks which one to move, and warns if one still seems open elsewhere.
 `--session <id>` picks one directly.
+
+### Agents
+
+Subagents run inside the Claude Code session, on its account, so they stop when it does: when you
+exit, and also when the account hits its limit (each of their requests counts against it). A running
+session can't change account, so no handoff can carry a running agent over. What it does instead:
+
+- **Continue them.** Each agent's transcript stays on disk next to the conversation's, and in a
+  resumed session Claude can continue an agent by sending it a message (`SendMessage` to its id); it
+  picks up with its context, now on the new account. When a handoff (`cas run` at the limit, or
+  `cas handoff`) resumes a conversation whose last session stopped agents before they finished,
+  cas opens the new session with a message that asks Claude to do that for each one:
+  `· 2 agents stopped before finishing; Claude continues them on personal: survey, tests`.
+  Agents stopped more than an hour before the conversation's last message are left alone (the
+  conversation went on without them), and so are agents' own agents. `cas handoff --no-agents`
+  skips it once, `resume_agents: false` always. A handoff that opens `/limit-reset` can't also send
+  that message; cas prints which agents to ask Claude to continue afterwards.
+- **Warn first.** From `agent_warning` points before `switch_threshold` (default 15, so from 75%
+  of the 5-hour window used), the status line warns while agents are at work. Switching once they
+  are done interrupts nothing. At the limit it counts the ones that stopped:
+  `limit: exit, then cas handoff → personal, which continues the 2 agents`.
 
 ## Logins over SSH (macOS Keychain)
 
@@ -265,6 +288,8 @@ one of these sources refreshes.
 | `weekly_threshold` | 97 | same, weekly |
 | `min_headroom` | 15 | an open window is preferred only with this much left |
 | `handoff` | `ask` | `ask`, `auto` (switch without asking; never uses resets) or `off` |
+| `resume_agents` | true | a handoff asks Claude to continue the agents the last session stopped |
+| `agent_warning` | 15 | the status line warns about running agents this many points before `switch_threshold` (0 = never) |
 | `live_usage` | `auto` | `auto`, `always` or `never` |
 | `prime_model` | `haiku` | model for window-opening pings |
 | `prime_others_on_start` | true | `cas run` opens the other accounts' windows in the background |
@@ -278,7 +303,8 @@ Per profile: `cas set work --label "Work Max" --model sonnet --disable`.
 ## Notes
 
 - `cas` relies on Claude Code internals that are not a public API: the Keychain naming per
-  `CLAUDE_CONFIG_DIR`, the usage endpoint, the status line's `rate_limits` and `/limit-reset`. It was
+  `CLAUDE_CONFIG_DIR`, the usage endpoint, the status line's `rate_limits`, `/limit-reset`, and the
+  subagent transcripts (`<session>/subagents/agent-<id>.jsonl` and `.meta.json`). It was
   checked against 2.1.330. If an update changes one of them, `cas` falls back to the remaining
   sources, and `cas doctor` shows what broke.
 - Each account logs in normally from this machine; `cas` doesn't hide or spoof anything. Check that

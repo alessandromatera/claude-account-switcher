@@ -52,6 +52,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # What `cas run` does when Claude exits because the account hit its limit:
     # "ask" = offer to resume the conversation on the next account, "auto" = just do it, "off".
     "handoff": "ask",
+    # When a conversation moves to another account, have Claude continue the agents its previous
+    # session stopped (SendMessage to each agent's id) with the first message of the new session.
+    "resume_agents": True,
+    # The status line warns that agents are running once the 5-hour window is this many points from
+    # switch_threshold (0 = never), so you can hand off when none is mid-task.
+    "agent_warning": 15,
     # Copy user-scope MCP servers from ~/.claude.json into each profile before launch.
     "sync_mcp": True,
     # Model used for the tiny message that opens a 5-hour window.

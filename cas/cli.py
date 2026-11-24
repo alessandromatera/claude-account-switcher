@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, keychain, launchd, picker, planner, resets, shared
+from . import __version__, agents, keychain, launchd, picker, planner, resets, shared
 from . import profiles as prof
 from .config import (
     NAME_RULES,
@@ -64,10 +64,6 @@ from .usage import (
 
 SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "cas"
 MARKER = "managed by claude-account-switcher"
-LIMIT_RE = re.compile(
-    r"hit your (?:session |weekly |opus |sonnet |fable )?limit|usage limit reached|limit reached|rate_limit_error",
-    re.I,
-)
 PING_PROMPT = "Reply with exactly one word: ok"
 PING_SETTLE_WAITS = (0, 3, 5, 10)  # seconds before each try at reading the window a ping opened
 
@@ -387,10 +383,37 @@ def transcript_says_limit(session: Optional[str], cwds: Sequence[str], since: fl
             ts = parse_time(obj.get("timestamp"))
             if ts is not None and ts < since:
                 continue
-            if obj.get("isApiErrorMessage") or obj.get("type") == "system" or obj.get("error"):
-                if LIMIT_RE.search(json.dumps(obj)):
-                    return True
+            if agents.limit_error(obj):
+                return True
     return False
+
+
+def agents_to_continue(cfg: Config, session: Optional[str], since: Optional[float] = None) -> List[agents.Agent]:
+    """The agents a closed session stopped (by its end or by the limit), for the next one to continue.
+
+    `since`: when that session started; unknown, an hour before the conversation's last message."""
+    if not session or not cfg.settings.get("resume_agents", True):
+        return []
+    t = transcript_path(session)
+    if t is None:
+        return []
+    try:
+        found = agents.session_agents(t)
+        if found and since is None:
+            since = agents.last_at(t) - agents.HANDOFF_WINDOW_S
+        return agents.cut_off(found, since or 0)
+    except OSError:
+        return []
+
+
+def agents_prompt(cut: Sequence[agents.Agent], account: str, style: Style) -> List[str]:
+    """The opening message that has Claude continue `cut` on `account` (none when there are none)."""
+    if not cut:
+        return []
+    n = len(cut)
+    print(style.dim(f"· {n} agent{'s' if n != 1 else ''} stopped before finishing; Claude continues "
+                    f"{'them' if n != 1 else 'it'} on {account}: " + ", ".join(a.name() for a in cut)))
+    return [agents.resume_prompt(cut, account)]
 
 
 def carry_flags(args: Sequence[str]) -> List[str]:
@@ -787,13 +810,14 @@ def run_claude(claude: str, args: List[str], p: Profile) -> int:
         return 130
 
 
-def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style: Style) -> int:
+def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style: Style,
+             prompt: Sequence[str] = ()) -> int:
     if in_claude_code():
         return die("you are inside a Claude Code session; exit it first, then run this from your terminal")
     claude = find_claude(cfg)
     cwds = cwd_candidates()
     rc = 0
-    pending: List[str] = []  # one-shot trailing prompt, e.g. "/limit-reset"
+    pending: List[str] = list(prompt)  # one-shot trailing prompt, e.g. "/limit-reset"
     limited: List[str] = []  # accounts that hit their limit during this run: never hand back to them
     reset_offered: List[str] = []  # offer a limit reset at most once per account per run
     while True:
@@ -837,8 +861,10 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
         rows = gather(cfg)
         action = decide(cfg, rows, style, p, mode, also_exclude=limited, no_reset_for=reset_offered)
         resume = ["--resume", session] if session else ["--continue"]
+        cut = agents_to_continue(cfg, session, since=started - 5) if action.profile else []
         if action.kind == "switch" and action.profile:
             target, claude_args = action.profile.name, carry_flags(claude_args) + resume
+            pending = agents_prompt(cut, target, style)
             continue
         if action.kind == "reset" and action.profile:
             target = action.profile.name
@@ -849,14 +875,25 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
                 pending = resets.limit_reset_arg(action.grant)
                 print(style.dim("Opening /limit-reset in Claude Code. Nothing is used until you confirm there "
                                 "(if no dialog appears, type /limit-reset)."))
+                agents_hint(cut, style)
             elif use_reset_on_web(action.profile, cfg.settings, style):
                 claude_args = carry_flags(claude_args) + (["--resume", session] if session else ["--continue"])
+                pending = agents_prompt(cut, target, style)
             else:
                 return rc
             if target in limited:
                 limited.remove(target)  # it may have room again after the reset
             continue
         return rc
+
+
+def agents_hint(cut: Sequence[agents.Agent], style: Style) -> None:
+    """The session opens on /limit-reset, not on a prompt: say how to get the stopped agents going."""
+    if cut:
+        n = len(cut)
+        print(style.dim(f"{n} agent{'s' if n != 1 else ''} stopped before finishing "
+                        f"({', '.join(a.name() for a in cut)}). After the reset, ask Claude to continue "
+                        f"{'them' if n != 1 else 'it'} with SendMessage."))
 
 
 def use_reset_on_web(p: Profile, settings: Dict[str, Any], style: Style) -> bool:
@@ -1005,10 +1042,12 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     if not session:
         return die("no conversation found for this directory; run `cas run` instead")
     t = transcript_path(session)
-    if t and time.time() - t.stat().st_mtime < 90 and \
+    if t and time.time() - max([t.stat().st_mtime] + [a.mtime() for a in agents.session_agents(t)
+                                                        if not a.finished]) < 90 and \
             not confirm(f"{session[:8]} was active less than 90s ago; if it's still open elsewhere, both would "
                         "write to it. Continue?", default=False):
         return 1
+    cut = [] if args.no_agents else agents_to_continue(cfg, session)
     src = session_profile(cfg, session)
     target = args.profile
     if not target:
@@ -1028,13 +1067,15 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         else:
             a = decide(cfg, rows, style, src, "ask")
             if a.kind == "reset" and a.profile:
+                agents_hint(cut, style)
                 return run_loop(cfg, a.profile.name, ["--resume", session] + resets.limit_reset_arg(a.grant),
                                 "ask", style)
             if a.kind not in ("switch", "start") or not a.profile:
                 return 0
             target = a.profile.name
     mode = "auto" if args.yes else cfg.settings.get("handoff", "ask")
-    return run_loop(cfg, target, ["--resume", session] + list(args.claude_args or []), mode, style)
+    return run_loop(cfg, target, ["--resume", session] + list(args.claude_args or []), mode, style,
+                    prompt=agents_prompt(cut, target, style))
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -2203,6 +2244,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile", nargs="?")
     s.add_argument("--session", help="conversation id (default: latest here)")
     s.add_argument("-y", "--yes", action="store_true", help="later handoffs without asking")
+    s.add_argument("--no-agents", action="store_true",
+                   help="don't ask Claude to continue the agents the last session stopped")
     s.add_argument("claude_args", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_handoff)
 

@@ -11,7 +11,7 @@ from unittest import mock
 
 from cas import __version__, cli, current, launchd, planner, resets, shared, statusline, usage
 from cas.config import Config
-from tests.helpers import IsolatedHome
+from tests.helpers import AGENT_INTERRUPTED, AGENT_LIMIT, AGENT_WORKING, IsolatedHome, write_agent
 
 
 def run_cli(*argv):
@@ -269,8 +269,10 @@ class CliTest(IsolatedHome):
             a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
         self.assertEqual((a.kind, a.profile.name), ("switch", "work"))
 
-    def fake_run(self, cfg, mode, answers=None):
-        """Run run_loop with a fake `claude` that hits the limit whenever it runs on 'default'."""
+    def fake_run(self, cfg, mode, answers=None, agent=False):
+        """Run run_loop with a fake `claude` that hits the limit whenever it runs on 'default'.
+
+        agent: the limit also stops a subagent of the conversation."""
         cfg.settings["prime_others_on_start"] = False  # never spawn real background pings from tests
         proj = self.home / "proj"
         proj.mkdir()
@@ -289,11 +291,18 @@ class CliTest(IsolatedHome):
             "    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()\n"
             "    (d / (sid + '.jsonl')).write_text(json.dumps({'type': 'assistant', 'isApiErrorMessage': True, "
             "'timestamp': ts, 'message': {'content': \"You've hit your session limit\"}}) + '\\n')\n"
+            "    if os.environ.get('FAKE_AGENT'):\n"
+            "        a = d / sid / 'subagents'; a.mkdir(parents=True, exist_ok=True)\n"
+            "        (a / 'agent-a1.meta.json').write_text(json.dumps({'description': 'survey', 'finished': True}))\n"
+            "        (a / 'agent-a1.jsonl').write_text(json.dumps({'type': 'assistant', 'isApiErrorMessage': True, "
+            "'error': 'rate_limit', 'timestamp': ts, 'message': {'content': \"You've hit your 5-hour limit\"}}))\n"
         )
         fake.chmod(0o755)
         cwd = os.getcwd()
         os.environ.update(FAKE_LOG=str(log), PWD=str(proj),
                           FAKE_PROJECTS=str(self.hub / "projects" / cli.sanitize(os.path.realpath(proj))))
+        if agent:
+            os.environ["FAKE_AGENT"] = "1"
         answers = list(answers or [])
         try:
             os.chdir(proj)
@@ -305,7 +314,7 @@ class CliTest(IsolatedHome):
                 rc = cli.run_loop(cfg, "default", ["--model", "opus", "hello"], mode, cli.Style(False))
         finally:
             os.chdir(cwd)
-            for k in ("FAKE_LOG", "FAKE_PROJECTS"):
+            for k in ("FAKE_LOG", "FAKE_PROJECTS", "FAKE_AGENT"):
                 os.environ.pop(k, None)
         self.assertEqual(rc, 0)
         return [json.loads(x) for x in log.read_text().splitlines()], out
@@ -324,6 +333,97 @@ class CliTest(IsolatedHome):
         self.assertEqual(calls[1]["cfg"], str(cfg.get("work").config_dir))
         self.assertEqual(calls[1]["args"], ["--model", "opus", "--resume", sid], "resumes exactly its own session")
         self.assertIn("handoff: auto → work", out.getvalue())
+
+    def test_run_loop_has_claude_continue_the_agents_the_limit_stopped(self):
+        self.add_profile()
+        cfg = Config.load()
+        cfg.settings["live_usage"] = "never"
+        calls, out = self.fake_run(cfg, "auto", agent=True)
+        self.assertEqual(len(calls), 2, out.getvalue())
+        sid = calls[0]["args"][1]
+        self.assertEqual(calls[1]["args"][:4], ["--model", "opus", "--resume", sid])
+        prompt = calls[1]["args"][4]
+        self.assertIn("survey (agent id a1): it hit the usage limit", prompt)
+        self.assertIn("SendMessage", prompt)
+        self.assertIn("1 agent stopped before finishing; Claude continues it on work: survey", out.getvalue())
+
+        cfg.settings["resume_agents"] = False
+        os.remove(self.home / "calls.jsonl")
+        (self.home / "proj").rmdir()
+        calls, _ = self.fake_run(cfg, "auto", agent=True)
+        self.assertEqual(calls[1]["args"], ["--model", "opus", "--resume", calls[0]["args"][1]])
+
+    def test_handoff_continues_the_agents_its_session_stopped(self):
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 3600),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(8, now + 7200),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        statusline.main(json.dumps({"session_id": "s1", "workspace": {"current_dir": "/p"}}), cfg, {})
+        t = self.hub / "projects" / cli.sanitize("/p") / "s1.jsonl"
+        t.parent.mkdir(parents=True)
+        t.write_text(json.dumps({"type": "user", "timestamp": "2026-01-01T09:00:00Z",
+                                 "message": {"content": "go"}}) + "\n")
+        os.utime(t, (now - 600, now - 600))
+        write_agent(t, "a1", AGENT_INTERRUPTED, False, now - 300, description="survey")
+        write_agent(t, "a2", AGENT_WORKING, False, now - 300, depth=2)
+
+        def handoff(*extra):
+            args = cli.build_parser().parse_args(["handoff", "--session", "s1", *extra])
+            with mock.patch.object(cli, "run_loop", return_value=0) as rl, redirect_stdout(io.StringIO()) as out:
+                cli.cmd_handoff(args)
+            return rl.call_args, out.getvalue()
+
+        call, out = handoff()
+        self.assertEqual(call[0][1:3], ("work", ["--resume", "s1"]))
+        (prompt,) = call[1]["prompt"]
+        self.assertIn("survey (agent id a1): the session closed", prompt)
+        self.assertNotIn("a2", prompt, "an agent's own agents are its business")
+        self.assertIn("Claude continues it on work: survey", out)
+        call, _ = handoff("--no-agents")
+        self.assertEqual(call[1]["prompt"], [])
+
+        # an agent still writing means the session may still be open: ask first
+        write_agent(t, "a1", AGENT_WORKING, False, time.time())
+        args = cli.build_parser().parse_args(["handoff", "--session", "s1"])
+        with mock.patch.object(cli, "confirm", return_value=False) as ask, mock.patch.object(cli, "run_loop") as rl, \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.cmd_handoff(args), 1)
+        self.assertIn("active less than 90s ago", ask.call_args[0][0])
+        rl.assert_not_called()
+
+    def test_statusline_warns_about_running_agents_near_the_limit(self):
+        p = self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(10, now + 3600),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        t = self.home / "proj" / "s1.jsonl"
+        t.parent.mkdir()
+        t.write_text("{}\n")
+        write_agent(t, "a1", AGENT_WORKING, False, now - 30)
+        write_agent(t, "a2", AGENT_WORKING, False, now - 30)
+
+        def line(pct):
+            payload = {"session_id": "s1", "transcript_path": str(t),
+                       "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": int(now) + 3600}}}
+            return statusline.main(json.dumps(payload), cfg, p.env({}))
+
+        self.assertIn("next: default", line(50))  # far from the limit: no warning
+        out = line(80)
+        self.assertIn("⚠ 2 agents running, limit near → let them finish, then exit and `cas handoff` → default", out)
+        self.assertNotIn("next:", out)
+        cfg.settings["agent_warning"] = 0
+        self.assertNotIn("agents running", line(80))
+        cfg.settings["agent_warning"] = 15
+
+        # at the limit the agents stop too; the handoff continues them
+        write_agent(t, "a2", AGENT_LIMIT, True, now)
+        self.assertIn("limit: exit, then `cas handoff` → default, which continues the 2 agents", line(100))
+        cfg.settings["resume_agents"] = False
+        self.assertNotIn("continues", line(100))
 
     def test_run_loop_reset_path_asks_and_offers_once(self):
         """No other account has room: the user picks the reset; it opens /limit-reset; never offered twice."""

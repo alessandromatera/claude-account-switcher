@@ -8,6 +8,10 @@ background when it's out of date (it shows on a later refresh), and prints one l
 
     work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%
 
+Near the limit, while this conversation's agents are at work, it says so: they stop when the
+account does, so switching once they're done interrupts nothing. At the limit it says how many
+stopped; `cas handoff` has Claude continue them on the next account.
+
 When this account's login is in the locked macOS Keychain (common over SSH), the session can't
 renew it and will ask for /login once its token expires: the line says so while there is time
 to unlock it.
@@ -21,8 +25,10 @@ import json
 import os
 import subprocess
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
+from . import agents as subagents
 from . import keychain, picker, resets
 from .config import Config, Profile
 from .usage import (
@@ -135,8 +141,26 @@ def outside_fix(env: Dict[str, str], transcript: Any) -> str:
     return f"{first} && claude" + ("" if empty else " -c")
 
 
+def session_agents(data: Any) -> List[subagents.Agent]:
+    tp = data.get("transcript_path") if isinstance(data, dict) else None
+    if not isinstance(tp, str) or not tp:
+        return []
+    return subagents.session_agents(Path(tp))
+
+
+def near_limit(e: Any, settings: Dict[str, Any]) -> bool:
+    margin = float(settings.get("agent_warning", 15) or 0)
+    return margin > 0 and e.five_pct is not None and \
+        e.five_pct >= float(settings.get("switch_threshold", 90)) - margin
+
+
+def _agents(n: int) -> str:
+    return f"{n} agent{'s' if n != 1 else ''}"
+
+
 def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True,
-           keychain_locked: bool = False, outside: Optional[Profile] = None, fix: str = "") -> str:
+           keychain_locked: bool = False, outside: Optional[Profile] = None, fix: str = "",
+           agents: Sequence[subagents.Agent] = ()) -> str:
     now = time.time() if now is None else now
     c = _c if color else (lambda _code, s: s)
     if p is None:
@@ -162,9 +186,14 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
 
     items = [(q, effective(best_snapshot(q), now)) for q in cfg.profile_list()]
     alt = picker.best(items, cfg.settings, exclude={p.name})
-    if picker.exhausted(e, cfg.settings):
+    exhausted = picker.exhausted(e, cfg.settings)
+    running = subagents.running(agents, now) if not exhausted and near_limit(e, cfg.settings) else []
+    if exhausted:
         if alt:
-            line += " │ " + c("33", f"limit: exit, then `cas handoff` → {alt.profile.name}")
+            stopped = subagents.cut_off(agents, now - subagents.HANDOFF_WINDOW_S) \
+                if cfg.settings.get("resume_agents", True) else []
+            line += " │ " + c("33", f"limit: exit, then `cas handoff` → {alt.profile.name}" +
+                              (f", which continues the {_agents(len(stopped))}" if stopped else ""))
         elif n or (rs and rs.has_any(now)):
             line += " │ " + c("36", "limit reset available: /limit-reset")
         else:
@@ -172,6 +201,11 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
             line += " │ " + c("31", "all accounts at limit" + (f" · first reset {_hm(soon)}" if soon else ""))
     elif outside is not None:
         line += " │ " + c("33", f"⚠ opened outside cas, which is on {outside.name} → exit, then: {fix}")
+    elif running:
+        them = "them" if len(running) != 1 else "it"
+        line += " │ " + c("33", f"⚠ {_agents(len(running))} running, limit near" +
+                          (f" → let {them} finish, then exit and `cas handoff` → {alt.profile.name}" if alt
+                           else ", no other account has room"))
     elif alt:
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
         old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
@@ -212,7 +246,11 @@ def main(raw: str, cfg: Optional[Config] = None, env: Optional[Dict[str, str]] =
         fix = outside_fix(env, data.get("transcript_path") if isinstance(data, dict) else None) if outside else ""
     except OSError:
         outside, fix = None, ""
-    ours = render(cfg, p, now, keychain_locked=locked, outside=outside, fix=fix)
+    try:
+        found = session_agents(data)
+    except Exception:
+        found = []  # a status line must never break over this
+    ours = render(cfg, p, now, keychain_locked=locked, outside=outside, fix=fix, agents=found)
     if p is not None:
         try:
             refresh_others(cfg, p)  # shows on a later refresh, once the fetch is back
