@@ -8,6 +8,10 @@ background when it's out of date (it shows on a later refresh), and prints one l
 
     work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 100%
 
+When no other account has room, it shows the one that frees up first instead of `next:`:
+
+    work 5h 58% left ↻14:20 · wk 76% │ personal 5h 0% ↻15:10 ⟲
+
 Near the limit, while this conversation's agents are at work, it says so: they stop when the
 account does, so switching once they're done interrupts nothing. At the limit it says how many
 stopped; `cas handoff` has Claude continue them on the next account.
@@ -158,6 +162,30 @@ def _agents(n: int) -> str:
     return f"{n} agent{'s' if n != 1 else ''}"
 
 
+def waiting(cfg: Config, b: picker.Blocked, now: float, c: Any) -> str:
+    """The other account when none has room (the one free soonest): what's left and when it frees up."""
+    from .cli import when  # cli imports this module lazily: no cycle
+
+    e = b.eff
+    if e.five_pct is not None and e.five_pct >= float(cfg.settings.get("switch_threshold", 90)):
+        label, pct, at = "5h", e.five_pct, e.five_resets
+    elif e.week_pct is not None and e.week_pct >= float(cfg.settings.get("weekly_threshold", 97)):
+        label, pct, at = "wk", e.week_pct, e.week_resets
+    else:
+        return c("2", f" │ {b.profile.name} {b.reason}")  # not logged in
+    left = max(0.0, 100 - pct)
+    out = c("2", f" │ {b.profile.name} ") + c(_left_color(left), f"{label} {left:.0f}%")
+    if at:
+        out += c("2", f" ↻{when(at, now)}")
+    rs = resets.best_status(b.profile, now)
+    n = rs.count(now) if rs else None
+    if n or (rs and rs.has_any(now)):
+        out += " " + c("36", f"⟲{n or ''}")  # a reset there would free it now: `cas reset`
+    if e.age is not None and e.age > 2 * float(cfg.settings.get("live_max_age_s", 300)):
+        out += c("2", f" ({_old(e.age)})")
+    return out
+
+
 def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True,
            keychain_locked: bool = False, outside: Optional[Profile] = None, fix: str = "",
            agents: Sequence[subagents.Agent] = ()) -> str:
@@ -185,7 +213,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
     line = " ".join(parts[:2]) + "".join(f" · {x}" for x in parts[2:])
 
     items = [(q, effective(best_snapshot(q), now)) for q in cfg.profile_list()]
-    alt = picker.best(items, cfg.settings, exclude={p.name})
+    ordered, blocked = picker.rank(items, cfg.settings, exclude={p.name})
+    alt = ordered[0] if ordered else None
     exhausted = picker.exhausted(e, cfg.settings)
     running = subagents.running(agents, now) if not exhausted and near_limit(e, cfg.settings) else []
     if exhausted:
@@ -210,6 +239,8 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         left = "?" if alt.eff.five_pct is None else f"{100 - alt.eff.five_pct:.0f}%"
         old = alt.eff.age is not None and alt.eff.age > 2 * float(cfg.settings.get("live_max_age_s", 300))
         line += c("2", f" │ next: {alt.profile.name} {left}" + (f" ({_old(alt.eff.age)})" if old else ""))
+    elif blocked:
+        line += waiting(cfg, blocked[0], now, c)
     if keychain_locked:
         line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")
     return line
