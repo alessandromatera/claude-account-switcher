@@ -1070,8 +1070,8 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     if not session:
         return die("no conversation found for this directory; run `cas run` instead")
     t = transcript_path(session)
-    if t and time.time() - last_activity(t) < 90 and \
-            not confirm(f"{session[:8]} was active less than 90s ago; if it's still open elsewhere, both would "
+    if t and open_elsewhere(cfg, session, t) and \
+            not confirm(f"{session[:8]} looks still open elsewhere; if it is, both would "
                         "write to it. Continue?", default=False):
         return 1
     cut = [] if args.no_agents else agents_to_continue(cfg, session)
@@ -1120,6 +1120,35 @@ def last_activity(t: Path) -> float:
     return max([own] + [a.mtime() for a in agents.session_agents(t) if not a.finished])
 
 
+def open_elsewhere(cfg: Config, session: str, t: Path) -> bool:
+    """Whether a conversation may still be open in a running Claude Code, so that carrying it on
+    would make two writers. Claude Code keeps `<config dir>/sessions/<pid>.json` for every running
+    session: with that, the answer is exact (your own handover, moments after you exit, is not
+    "open"). Without it (an older Claude Code), a transcript written in the last 90s counts as open."""
+    seen = False
+    for d in [p.dir for p in cfg.profile_list()] + [hub_dir()]:
+        reg = d / "sessions"
+        if not reg.is_dir():
+            continue
+        seen = True
+        for f in reg.glob("*.json"):
+            try:
+                e = json.loads(f.read_text())
+                pid = int(e["pid"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if e.get("sessionId") != session or pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue  # left behind by a Claude Code that is gone
+            except OSError:
+                pass  # alive, but not ours to signal
+            return True
+    return False if seen else time.time() - last_activity(t) < 90
+
+
 def short_path(p: Path) -> str:
     h, s = str(home()).rstrip("/"), str(p)
     return "~" + s[len(h):] if s == h or s.startswith(h + "/") else s
@@ -1166,8 +1195,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         return die(f"no transcript for {session} on this machine")
     still_open = session == inside
     now = time.time()
-    if not still_open and now - last_activity(t) < 90 and not confirm(
-            f"{session[:8]} was active less than 90s ago. If it's still open, what happens there from now on stays "
+    if not still_open and open_elsewhere(cfg, session, t) and not confirm(
+            f"{session[:8]} looks still open. If it is, what happens there from now on stays "
             "on this machine. Send it anyway?", default=False):
         return 1
     src = session_profile(cfg, session)
@@ -1288,8 +1317,8 @@ def cmd_receive(args: argparse.Namespace) -> int:
     if pkg.manifest.get("open"):
         print(style.dim(f"  (sent from inside its session: anything done after that stays on {pkg.host})"))
     mine = hub_dir() / "projects" / sanitize(os.path.realpath(str(where))) / f"{pkg.session}.jsonl"
-    if mine.exists() and now - last_activity(mine) < 90 and not confirm(
-            f"This machine's copy of {pkg.session[:8]} was active less than 90s ago; if it's open here, both would "
+    if mine.exists() and open_elsewhere(cfg, pkg.session, mine) and not confirm(
+            f"This machine's copy of {pkg.session[:8]} looks open here; if it is, both would "
             "write to it. Replace it anyway (the current one goes to a backup)?", default=False):
         return 1
     try:

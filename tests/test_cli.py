@@ -458,8 +458,23 @@ class CliTest(IsolatedHome):
         with mock.patch.object(cli, "confirm", return_value=False) as ask, mock.patch.object(cli, "run_loop") as rl, \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(cli.cmd_handoff(args), 1)
-        self.assertIn("active less than 90s ago", ask.call_args[0][0])
+        self.assertIn("still open", ask.call_args[0][0])
         rl.assert_not_called()
+
+    def test_open_elsewhere_follows_the_running_sessions_not_the_file_time(self):
+        p = self.add_profile()
+        cfg = Config.load()
+        t = self.home / "proj" / "s1.jsonl"
+        t.parent.mkdir(parents=True, exist_ok=True)
+        t.write_text("{}\n")  # written just now: your own handover
+        self.assertTrue(cli.open_elsewhere(cfg, "s1", t), "no registry (older Claude Code): file time decides")
+        reg = p.dir / "sessions"
+        reg.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(cli.open_elsewhere(cfg, "s1", t), "registry says nothing runs it")
+        (reg / "999999999.json").write_text(json.dumps({"pid": 999999999, "sessionId": "s1"}))
+        self.assertFalse(cli.open_elsewhere(cfg, "s1", t), "a dead pid is a leftover")
+        (reg / "1.json").write_text(json.dumps({"pid": os.getppid(), "sessionId": "s1"}))
+        self.assertTrue(cli.open_elsewhere(cfg, "s1", t), "a live Claude Code holds it")
 
     def test_statusline_warns_about_running_agents_near_the_limit(self):
         p = self.add_profile()
@@ -789,7 +804,7 @@ class CliTest(IsolatedHome):
         with mock.patch.object(cli, "confirm", return_value=False) as ask, \
                 mock.patch.object(shared, "host", return_value="desktop"):
             self.assertEqual(run_cli("send", "--session", sid[:8])[0], 1)
-        self.assertIn("active less than 90s ago", ask.call_args[0][0])
+        self.assertIn("still open", ask.call_args[0][0])
         os.utime(t, (time.time() - 600,) * 2)
         with mock.patch.object(shared, "host", return_value="desktop"):
             self.assertEqual(run_cli("send", "--session", sid[:8])[0], 0)
