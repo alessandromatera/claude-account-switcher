@@ -278,11 +278,17 @@ class CliTest(IsolatedHome):
             a = cli.decide(cfg, rows, style, cfg.hub(), "ask")
         self.assertEqual((a.kind, a.grant.id), ("reset", "g1"))
         self.assertIn("(recommended)", buf.getvalue())
+        # [2] opens Claude Code on the account that frees up first (work, in 1h; default needs 2h) and waits there
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="2"), \
+                redirect_stdout(io.StringIO()) as buf:
+            a = cli.decide(cfg, rows, style, cfg.hub(), "ask")
+        self.assertEqual((a.kind, a.profile.name), ("start", "work"))
+        self.assertIn("open Claude Code on work anyway and wait for", buf.getvalue())
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="3"), \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(cli.decide(cfg, rows, style, cfg.hub(), "ask").kind, "wait")
 
-    def test_decide_unknown_resets_offers_a_check_but_recommends_waiting(self):
+    def test_decide_unknown_resets_offers_a_check_but_recommends_opening_and_waiting(self):
         cfg = Config.load()
         now = time.time()
         usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 7200),
@@ -292,12 +298,29 @@ class CliTest(IsolatedHome):
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value=""), \
                 redirect_stdout(io.StringIO()) as buf:
             a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
-        self.assertEqual(a.kind, "wait")
+        self.assertEqual((a.kind, a.profile.name), ("start", "default"))
         self.assertIn("check for a limit reset on default", buf.getvalue())
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="1"), \
                 redirect_stdout(io.StringIO()):
             a = cli.decide(cfg, rows, cli.Style(False), cfg.hub(), "ask")
         self.assertEqual((a.kind, a.grant), ("reset", None))
+
+    def test_decide_at_every_limit_opens_claude_on_the_account_that_frees_up_first(self):
+        self.add_profile()
+        cfg = Config.load()
+        now = time.time()
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(100, now + 3 * 3600),
+                                                         usage.Window(30, now + 86400), "acct-hub"))
+        usage.record_snapshot("work", usage.Snapshot(now, "live", usage.Window(100, now + 1800),
+                                                      usage.Window(30, now + 86400), "acct-work"))
+        rows = cli.gather(cfg, live=False)
+        for current in (cfg.hub(), None):  # a conversation at its limit, or a fresh start
+            with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value=""), \
+                    redirect_stdout(io.StringIO()) as buf:
+                a = cli.decide(cfg, rows, cli.Style(False), current, "ask")
+            self.assertEqual((a.kind, a.profile.name), ("start", "work"), buf.getvalue())
+            self.assertIn("open Claude Code on work anyway and wait for", buf.getvalue())
+            self.assertIn("(recommended)", buf.getvalue())
 
     def test_decide_prefers_free_switch_over_reset(self):
         self.add_profile()
@@ -483,7 +506,7 @@ class CliTest(IsolatedHome):
                                                       usage.Window(30, now + 86400), "acct-work"))
         resets.record("default", resets.parse_status({"eligible": True, "grants": [
             {"id": "g1", "resets_left": 1, "clears": ["five_hour"], "type": "session"}]}, now))
-        calls, out = self.fake_run(cfg, "auto", answers=["", ""])  # Enter = recommended, twice
+        calls, out = self.fake_run(cfg, "auto", answers=["", "2"])  # Enter = the reset, then "stop here and wait"
         self.assertEqual(len(calls), 2, out.getvalue())
         self.assertEqual(calls[1]["profile"], "default")
         self.assertEqual(calls[1]["args"], ["--model", "opus", "--resume", calls[0]["args"][1], "/limit-reset 5-hour"])
@@ -565,7 +588,7 @@ class CliTest(IsolatedHome):
         with mock.patch.object(cli.subprocess, "call", side_effect=fake_call), \
                 mock.patch.object(cli, "confirm", return_value=True), \
                 mock.patch.object(cli, "refresh", side_effect=lambda p, s, live=None: (usage.best_snapshot(p), None)):
-            calls, out = self.fake_run(cfg, "auto", answers=["", ""])
+            calls, out = self.fake_run(cfg, "auto", answers=["", "2"])
         self.assertEqual(opened, [resets.WEB_USAGE_URL])
         self.assertIn("use full reset on default", out.getvalue())
         self.assertIn("click Reset there", out.getvalue())

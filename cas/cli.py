@@ -629,11 +629,24 @@ def decide(cfg: Config, rows: List[Row], style: Style, current: Optional[Profile
                 "opens Claude Code's /limit-reset, you confirm there" if via_cc
                 else "opens claude.ai's usage page, you click Reset there")
         options.append((Action("reset", r.profile, g), label))
+    # Nothing to switch to: Claude Code can still be opened (to read the conversation, queue the next
+    # prompt, see its own reset time) on the account that frees up first, instead of leaving you at a prompt.
+    open_opt: Optional[int] = None
+    if not alt:
+        cands: List[Tuple[Optional[float], Profile]] = [(b.until, b.profile) for b in blocked
+                                                       if b.profile.logged_in()]
+        if current and current.logged_in():
+            cands.append((wait_until, current))
+        timed = [c for c in cands if c[0]]
+        pick = min(timed, key=lambda c: c[0]) if timed else (cands[0] if cands else None)
+        if pick:
+            until, op = pick
+            open_opt = len(options)
+            options.append((Action("start", op), f"open Claude Code on {op.name} anyway and wait"
+                            + (f" for {when(until, now)}" if until else "")))
     if current:
         options.append((Action("wait"), "stop here and wait" + (f" for {when(wait_until, now)}" if wait_until else "")))
     else:
-        if blocked and blocked[0].profile.logged_in():
-            options.append((Action("start", blocked[0].profile), f"start on {blocked[0].profile.name} anyway"))
         options.append((Action("wait"), "do nothing"))
 
     rec = 0
@@ -646,6 +659,8 @@ def decide(cfg: Config, rows: List[Row], style: Style, current: Optional[Profile
         rec = 0 if (long_wait or expiring) else len(options) - 1
     if not alt and not reset_opt:
         rec = len(options) - 1
+    if open_opt is not None and rec == len(options) - 1:
+        rec = open_opt  # where "stop and wait" would be the pick, opening Claude Code and waiting there is better
 
     if mode == "auto" and alt:
         print(style.dim(f"handoff: auto → {alt.profile.name}"))
@@ -872,7 +887,7 @@ def run_loop(cfg: Config, target: str, claude_args: List[str], mode: str, style:
         action = decide(cfg, rows, style, p, mode, also_exclude=limited, no_reset_for=reset_offered)
         resume = ["--resume", session] if session else ["--continue"]
         cut = agents_to_continue(cfg, session, since=started - 5) if action.profile else []
-        if action.kind == "switch" and action.profile:
+        if action.kind in ("switch", "start") and action.profile:
             target, claude_args = action.profile.name, carry_flags(claude_args) + resume
             pending = agents_prompt(cut, target, style)
             continue

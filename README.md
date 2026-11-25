@@ -90,10 +90,13 @@ on every account and offers three choices:
 
 1. continue the same conversation on another account (`claude --resume <id>`, same transcript)
 2. use a limit reset on this account, if it has one
-3. wait
+3. open Claude Code anyway on the account that frees up first, and wait there (when no account has
+   room): you can still read the conversation and queue your next prompt, and Claude Code shows its
+   own reset time. `cas handoff` and `cas receive` offer it too
+4. stop
 
 It recommends switching when another account has room (free). Otherwise it recommends a reset when
-the wait is long or the reset expires soon. `cas run -y` switches without asking, but it never uses
+the wait is long or the reset expires soon, and opening Claude Code and waiting when it isn't. `cas run -y` switches without asking, but it never uses
 a reset on its own.
 
 **Which conversation moves.** `cas run` gives each conversation its own id (`--session-id`), so the
