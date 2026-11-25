@@ -10,6 +10,7 @@ Store layout (<store> is a folder your machines keep in sync):
     agents/ commands/ skills/      your agents, commands and skills (not skills/synced: that one
                                    is Claude Code's own per-account sync of claude.ai skills)
     skills-links.json              top-level skills that are symlinks under projects_root
+    handoffs/                      conversations on their way to another machine (cas send; transfer.py)
 
 Files are copied, never symlinked into the shared folder (Claude Code refuses some writes through symlinks).
 Each file is synced three-way against the version seen at the last sync, so cas knows which side

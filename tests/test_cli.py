@@ -3,6 +3,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -701,6 +702,81 @@ class CliTest(IsolatedHome):
             self.assertEqual(cli.active_profile(Config.load()).name, "work")
             run_cli("add", "third", "--no-login")
             self.assertNotEqual(cli.main(["use", "third"]), 0, "not logged in: refused")
+
+    def test_send_and_receive_a_conversation_between_machines(self):
+        self.add_profile()
+        store = self.home / "store"
+        cfg = Config.load()
+        cfg.settings["shared_store"] = str(store)
+        cfg.save()
+        proj = self.home / "proj"
+        proj.mkdir()
+        here = os.path.realpath(proj)
+        sid = "7d1e9b2c-2222-4c2b-9d7e-0123456789ab"
+        t = self.hub / "projects" / cli.sanitize(here) / f"{sid}.jsonl"
+        t.parent.mkdir(parents=True)
+        t.write_text(json.dumps({"type": "user", "cwd": here, "timestamp": "2026-11-25T09:00:00Z",
+                                 "message": {"content": "port the parser"}}) + "\n")
+        write_agent(t, "a1", AGENT_INTERRUPTED, False, time.time() - 300, description="survey")
+        os.utime(t, (time.time() - 600,) * 2)
+        with mock.patch.object(shared, "host", return_value="laptop"):
+            with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": sid}):
+                rc, out = run_cli("send")  # `! cas send` inside the session: exactly that one
+            self.assertEqual(rc, 0, out)
+            self.assertIn(f"Sent {sid[:8]} “port the parser”", out)
+            self.assertIn("cas receive. It continues there in ~/proj, on the account cas picks", out)
+            self.assertIn("still open: exit it now", out)
+            self.assertIn("No other machine uses this shared folder yet", out)
+            self.assertNotEqual(cli.main(["receive"]), 0, "nothing from the other machines here")
+            self.assertIn("for another one", run_cli("receive", "--list")[1])
+        t.unlink()
+        shutil.rmtree(t.with_suffix(""))  # the other machine doesn't have it
+        seen = {}
+
+        def fake_loop(cfg, target, args, mode, style, prompt=()):
+            seen.update(target=target, args=args, cwd=os.getcwd(), prompt=list(prompt))
+            return 0
+
+        cwd = os.getcwd()
+        try:
+            with mock.patch.object(shared, "host", return_value="desktop"), mock.patch.dict(os.environ):
+                os.chdir(proj)
+                with redirect_stdout(io.StringIO()) as hint:
+                    cli.waiting_hint(Config.load(), cli.Style(False))
+                self.assertIn("laptop sent a conversation for this folder", hint.getvalue())
+                self.assertIn("1 conversation sent from your other machines waits here: cas receive --list",
+                              run_cli("status", "--no-live")[1])
+                self.assertIn(f"{sid[:8]}  from laptop", run_cli("receive", "--list")[1])
+                os.chdir(self.home)  # receive goes to the project's folder by itself
+                with mock.patch.object(cli, "run_loop", side_effect=fake_loop):
+                    rc, out = run_cli("receive")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((seen["target"], seen["args"], seen["cwd"]), ("auto", ["--resume", sid], here))
+        (prompt,) = seen["prompt"]
+        self.assertIn("moved to this machine from laptop", prompt)
+        self.assertIn("survey (agent id a1): the session closed", prompt)
+        self.assertIn("Claude continues it here: survey", out)
+        self.assertIn("port the parser", t.read_text())
+        self.assertEqual(list((store / "handoffs").iterdir()), [], "taken out of the shared folder")
+
+        # from a terminal, a conversation active moments ago may still be open: ask first
+        os.utime(t, None)
+        with mock.patch.object(cli, "confirm", return_value=False) as ask, \
+                mock.patch.object(shared, "host", return_value="desktop"):
+            self.assertEqual(run_cli("send", "--session", sid[:8])[0], 1)
+        self.assertIn("active less than 90s ago", ask.call_args[0][0])
+        os.utime(t, (time.time() - 600,) * 2)
+        with mock.patch.object(shared, "host", return_value="desktop"):
+            self.assertEqual(run_cli("send", "--session", sid[:8])[0], 0)
+        with mock.patch.object(shared, "host", return_value="desktop"), \
+                mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertNotEqual(cli.main(["receive"]), 0, "inside a session: exit first")
+            rc, out = run_cli("receive", "--discard")  # the sender withdraws it
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Discarded", out)
+        self.assertEqual(list((store / "handoffs").iterdir()), [])
 
     def test_install_runs_cas_from_a_copy_and_points_everything_at_it(self):
         """Edits to the source folder (kept in Dropbox) must not change the cas in use until `cas install`."""

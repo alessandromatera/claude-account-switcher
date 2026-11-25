@@ -175,10 +175,13 @@ def cut_off(agents: Sequence[Agent], since: float) -> List[Agent]:
             if a.depth <= 1 and a.state() in ("running", "limit", "interrupted") and a.last_at() >= since]
 
 
-def resume_prompt(agents: Sequence[Agent], account: str) -> str:
-    """The first message of the resumed session: continue the agents the last one stopped."""
-    lines = [f"(cas) This conversation now runs on the {account} account. When the previous session "
-             "ended, these agents stopped before they finished:"]
+def resume_prompt(agents: Sequence[Agent], account: Optional[str], machine: Optional[str] = None) -> str:
+    """The first message of the resumed session: continue the agents the last one stopped.
+
+    machine: the conversation came from that machine (`cas receive`), on whichever account runs it here."""
+    moved = (f"This conversation moved to this machine from {machine}." if machine
+             else f"This conversation now runs on the {account} account.")
+    lines = [f"(cas) {moved} When the previous session ended, these agents stopped before they finished:"]
     for a in agents:
         why = "it hit the usage limit" if a.state() == "limit" else "the session closed"
         lines.append(f"- {a.name()} (agent id {a.id}): {why}. Its transcript: {a.transcript}")

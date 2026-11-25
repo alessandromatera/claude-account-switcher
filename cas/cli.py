@@ -5,6 +5,7 @@
   cas status                   what's left on every account: 5-hour, weekly, limit resets, credits
   cas run [name|auto] [args]   start Claude Code on an account; offers a handoff at the limit
   cas handoff [name]           resume the last conversation here on another account
+  cas send / cas receive       move a conversation to another machine (through the `cas share` folder)
   cas reset [name]             use a limit reset (opens Claude Code's /limit-reset; you confirm)
   cas ping <name|all>          open a 5-hour window now with a tiny message
   cas plan / cas schedule      plan and schedule window-opening pings (launchd)
@@ -20,13 +21,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, agents, keychain, launchd, picker, planner, resets, shared
+from . import __version__, agents, keychain, launchd, picker, planner, resets, shared, transfer
 from . import profiles as prof
 from .config import (
     NAME_RULES,
@@ -406,14 +408,17 @@ def agents_to_continue(cfg: Config, session: Optional[str], since: Optional[floa
         return []
 
 
-def agents_prompt(cut: Sequence[agents.Agent], account: str, style: Style) -> List[str]:
-    """The opening message that has Claude continue `cut` on `account` (none when there are none)."""
+def agents_prompt(cut: Sequence[agents.Agent], account: Optional[str], style: Style,
+                  machine: Optional[str] = None) -> List[str]:
+    """The opening message that has Claude continue `cut` on `account`, or here after a move from
+    `machine` (none when there are none)."""
     if not cut:
         return []
     n = len(cut)
+    where = "here" if machine else f"on {account}"
     print(style.dim(f"· {n} agent{'s' if n != 1 else ''} stopped before finishing; Claude continues "
-                    f"{'them' if n != 1 else 'it'} on {account}: " + ", ".join(a.name() for a in cut)))
-    return [agents.resume_prompt(cut, account)]
+                    f"{'them' if n != 1 else 'it'} {where}: " + ", ".join(a.name() for a in cut)))
+    return [agents.resume_prompt(cut, account, machine)]
 
 
 def carry_flags(args: Sequence[str]) -> List[str]:
@@ -538,6 +543,11 @@ def print_status(cfg: Config, rows: List[Row], style: Style, now: float, mark_cu
         p, where = get_current(cfg)
         print(style.dim(f"A fresh `claude` starts on {(p or cfg.hub()).name}, the account cas last used"
                         + (f" on {where}" if where else "") + " (`cas run` picks the best one)."))
+    waiting = transfer.pending(cfg.settings) if cfg.settings.get("shared_store") else []
+    if waiting:
+        n = len(waiting)
+        print(style.c("36", f"{n} conversation{'s' if n != 1 else ''} sent from your other machines "
+                            f"wait{'s' if n == 1 else ''} here: cas receive --list"))
 
 
 # --------------------------------------------------------------------------- decisions at the limit
@@ -956,8 +966,10 @@ def cmd_run(argv: List[str]) -> int:
         print(RUN_HELP)
         return 0
     mode = opts["mode"] or cfg.settings.get("handoff", "ask")
+    style = make_style()
+    waiting_hint(cfg, style)
     try:
-        return run_loop(cfg, target, rest, mode, make_style())
+        return run_loop(cfg, target, rest, mode, style)
     except UnknownProfile as e:
         return die(str(e))
 
@@ -1027,6 +1039,7 @@ def cmd_claude(argv: List[str]) -> int:
         env = p.env(env)
         if talk:
             refresh_in_background(cfg)  # for the status line, which only reads what cas recorded
+            waiting_hint(cfg, style, out=sys.stderr)
             print(style.dim(f"→ Claude Code on {p.name} ({p.display()})"), file=sys.stderr)
     try:
         os.execve(claude, [claude, *args], env)
@@ -1042,8 +1055,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     if not session:
         return die("no conversation found for this directory; run `cas run` instead")
     t = transcript_path(session)
-    if t and time.time() - max([t.stat().st_mtime] + [a.mtime() for a in agents.session_agents(t)
-                                                        if not a.finished]) < 90 and \
+    if t and time.time() - last_activity(t) < 90 and \
             not confirm(f"{session[:8]} was active less than 90s ago; if it's still open elsewhere, both would "
                         "write to it. Continue?", default=False):
         return 1
@@ -1076,6 +1088,222 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     mode = "auto" if args.yes else cfg.settings.get("handoff", "ask")
     return run_loop(cfg, target, ["--resume", session] + list(args.claude_args or []), mode, style,
                     prompt=agents_prompt(cut, target, style))
+
+
+# --------------------------------------------------------------------------- moving to another machine
+
+NO_STORE = ("a conversation moves to another machine through the folder `cas share` uses; turn that on first: "
+            "cas share --store <a folder your machines keep in sync>")
+
+
+def last_activity(t: Path) -> float:
+    """When a conversation, or one of its unfinished agents, last wrote to disk."""
+    try:
+        own = t.stat().st_mtime
+    except OSError:
+        return 0.0
+    return max([own] + [a.mtime() for a in agents.session_agents(t) if not a.finished])
+
+
+def short_path(p: Path) -> str:
+    h, s = str(home()).rstrip("/"), str(p)
+    return "~" + s[len(h):] if s == h or s.startswith(h + "/") else s
+
+
+def size_text(n: int) -> str:
+    return f"{n / 1e6:.1f} MB" if n >= 100_000 else f"{max(1, round(n / 1000))} kB"
+
+
+def find_transcript(session: str) -> Tuple[Optional[str], Optional[Path]]:
+    """(full id, transcript) of a conversation on this machine, from its id or the start of it."""
+    t = transcript_path(session)
+    if t:
+        return session, t
+    hits = {p.stem: p for p in (hub_dir() / "projects").glob(f"*/{glob_escape(session)}*.jsonl")}
+    if len(hits) == 1:
+        sid = next(iter(hits))
+        return sid, transcript_path(sid)
+    return None, None
+
+
+def glob_escape(s: str) -> str:
+    return re.sub(r"([*?\[])", r"[\1]", s)
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    """Put a conversation in the shared folder, for `cas receive` on another machine."""
+    cfg = Config.load()
+    style = make_style()
+    store = shared.store_path(cfg.settings)
+    if not store:
+        return die(NO_STORE)
+    inside = os.environ.get("CLAUDE_CODE_SESSION_ID") if in_claude_code() else None
+    if args.session:
+        session, t = find_transcript(args.session)
+        if not session:
+            return die(f"no conversation {args.session} on this machine")
+    else:
+        session = inside if inside and transcript_path(inside) else choose_session(cfg, cwd_candidates(), style)
+        t = transcript_path(session) if session else None
+        if not session or not t:
+            return die("no conversation found for this directory (--session <id> picks one)")
+    if t is None:
+        return die(f"no transcript for {session} on this machine")
+    still_open = session == inside
+    now = time.time()
+    if not still_open and now - last_activity(t) < 90 and not confirm(
+            f"{session[:8]} was active less than 90s ago. If it's still open, what happens there from now on stays "
+            "on this machine. Send it anyway?", default=False):
+        return 1
+    src = session_profile(cfg, session)
+    try:
+        pkg = transfer.pack(cfg.settings, session, t, label=transfer.title(t) or first_prompt(t),
+                            still_open=still_open, profile=src.name if src else None,
+                            account=src.account_uuid if src else None, now=now)
+    except (OSError, ValueError, tarfile.TarError) as e:
+        return die(f"could not send {session[:8]}: {e}")
+    print(style.good("✓") + f" Sent {session[:8]} “{pkg.label}” ({size_text(int(pkg.manifest['size']))}) "
+          f"to your other machines, through {short_path(store)}.")
+    rel = pkg.manifest.get("project")
+    root = str(cfg.settings.get("projects_root") or "~").rstrip("/")
+    there = (root if rel == "." else f"{root}/{rel}") if rel is not None else pkg.cwd
+    print(f"  On the other machine: cas receive. It continues there in {there}"
+          + ("" if rel is not None else " (the same path)") + ", on the account cas picks.")
+    if still_open:
+        print(style.warn("  This session is still open: exit it now. What happens here from now on stays on this "
+                         "machine (cas send again updates what you sent)."))
+        busy = agents.running(agents.session_agents(t), now)
+        if busy:
+            n = len(busy)
+            print(style.warn(f"  {n} agent{'s are' if n != 1 else ' is'} still at work; what "
+                             f"{'they do' if n != 1 else 'it does'} from now on stays here too. To take it along, "
+                             "wait until they finish, then cas send again."))
+    if not any(m.get("host") != shared.host() for m in shared.machines(store)):
+        print(style.dim("  No other machine uses this shared folder yet: run `cas share --store <the same folder>` "
+                        "there first."))
+    return 0
+
+
+def describe_package(cfg: Config, p: transfer.Package, now: float) -> str:
+    return f"{p.session[:8]}  from {p.host}, {age(now - p.sent_at)}  {short_path(p.local_dir(cfg.settings))}  {p.label}"
+
+
+def choose_package(cfg: Config, pkgs: List[transfer.Package], style: Style) -> Optional[transfer.Package]:
+    """The conversation to receive: the one sent for this folder, else ask among all of them."""
+    here = os.path.realpath(os.getcwd())
+    mine = [p for p in pkgs if os.path.realpath(str(p.local_dir(cfg.settings))) == here]
+    if len(mine) == 1:
+        return mine[0]
+    cands = mine or pkgs
+    if len(cands) == 1 or not sys.stdin.isatty():
+        if len(cands) > 1:
+            print(style.dim(f"{len(cands)} conversations waiting; taking the latest ({cands[0].session[:8]}). "
+                            "Pick another with --session <id>."))
+        return cands[0]
+    now = time.time()
+    print("Conversations sent from your other machines" + (" for this folder:" if mine else ":"))
+    for i, p in enumerate(cands, 1):
+        print(f"  [{i}] {describe_package(cfg, p, now)}")
+    try:
+        ans = input("Which one? (Enter = 1): ").strip()
+    except EOFError:
+        ans = ""
+    try:
+        idx = int(ans) - 1 if ans else 0
+    except ValueError:
+        return None
+    return cands[idx] if 0 <= idx < len(cands) else None
+
+
+def cmd_receive(args: argparse.Namespace) -> int:
+    """Continue a conversation another machine sent (cas send): put it in place here and resume it."""
+    cfg = Config.load()
+    style = make_style()
+    s = cfg.settings
+    if not shared.store_path(s):
+        return die(NO_STORE)
+    now = time.time()
+    pkgs, own = transfer.pending(s), transfer.pending(s, own=True)
+    if args.list:
+        if not pkgs and not own:
+            print("No conversation is waiting in the shared folder.")
+        for p in pkgs:
+            print(f"  {describe_package(cfg, p, now)}")
+        for p in own:
+            print(style.dim(f"  {p.session[:8]}  sent from this machine {age(now - p.sent_at)}, for another one  "
+                            f"{p.label}"))
+        return 0
+    if in_claude_code() and not args.discard:
+        return die("you are inside a Claude Code session; exit it first, then run this from your terminal")
+    pool = pkgs + own if args.discard else pkgs  # what you sent yourself can be withdrawn too
+    if args.session:
+        hits = [p for p in pool if p.session.startswith(args.session)]
+        if len(hits) != 1:
+            return die(f"no conversation {args.session} is waiting" if not hits
+                       else f"{args.session} matches several; give more of its id")
+        pkg: Optional[transfer.Package] = hits[0]
+    elif not pool:
+        if own:
+            n = len(own)
+            return die(f"nothing is waiting from your other machines; the {n if n > 1 else ''}"
+                       f"{' conversations' if n > 1 else 'conversation'} sent from this one "
+                       f"wait{'s' if n == 1 else ''} for another machine: run cas receive there")
+        return die("nothing is waiting from your other machines. On the machine you're leaving: cas send")
+    else:
+        pkg = choose_package(cfg, pool, style)
+    if pkg is None:
+        return 1
+    if args.discard:
+        transfer.discard(pkg)
+        print(f"Discarded {pkg.session[:8]} “{pkg.label}”, sent from {pkg.host}. Its own machine still has it.")
+        return 0
+    problem = pkg.problem()
+    if problem:
+        return die(f"{pkg.session[:8]} from {pkg.host}: {problem}")
+    where = pkg.local_dir(s)
+    here = Path(os.getcwd())
+    if not where.is_dir():
+        print(f"{pkg.session[:8]} ran in {pkg.cwd} on {pkg.host}; this machine has no {short_path(where)}.")
+        if not confirm(f"Continue it here, in {short_path(here)}?", default=False):
+            return 1
+        where = here
+    print(style.dim(f"{pkg.session[:8]} from {pkg.host}, sent {age(now - pkg.sent_at)}: {pkg.label}"))
+    if os.path.realpath(str(where)) != os.path.realpath(str(here)):
+        print(style.dim(f"→ in {short_path(where)}"))
+    if pkg.manifest.get("open"):
+        print(style.dim(f"  (sent from inside its session: anything done after that stays on {pkg.host})"))
+    mine = hub_dir() / "projects" / sanitize(os.path.realpath(str(where))) / f"{pkg.session}.jsonl"
+    if mine.exists() and now - last_activity(mine) < 90 and not confirm(
+            f"This machine's copy of {pkg.session[:8]} was active less than 90s ago; if it's open here, both would "
+            "write to it. Replace it anyway (the current one goes to a backup)?", default=False):
+        return 1
+    try:
+        _, acts = transfer.unpack(s, pkg, str(where))
+    except (OSError, ValueError, tarfile.TarError) as e:
+        return die(f"could not receive {pkg.session[:8]}: {e}")
+    for a in acts:
+        print(style.dim(f"· {a}"))
+    os.chdir(where)
+    os.environ["PWD"] = str(where)
+    cut = [] if args.no_agents else agents_to_continue(cfg, pkg.session)
+    mode = "auto" if args.yes else s.get("handoff", "ask")
+    return run_loop(cfg, args.profile or "auto", ["--resume", pkg.session] + list(args.claude_args or []), mode,
+                    style, prompt=agents_prompt(cut, None, style, machine=pkg.host))
+
+
+def waiting_hint(cfg: Config, style: Style, out: Any = None) -> None:
+    """Say that another machine sent a conversation for this folder (cas receive continues it)."""
+    if not cfg.settings.get("shared_store"):
+        return
+    try:
+        pkgs = transfer.waiting_here(cfg.settings, os.getcwd())
+    except Exception:  # an offline shared folder must not get in the way of starting claude
+        return
+    if pkgs:
+        p = pkgs[0]
+        more = f" (and {len(pkgs) - 1} more)" if len(pkgs) > 1 else ""
+        print(style.warn(f"· {p.host} sent a conversation for this folder {age(time.time() - p.sent_at)}: "
+                         f"“{p.label}”{more}. To continue it: exit, then cas receive"), file=out)
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -1474,6 +1702,8 @@ def cmd_share(args: argparse.Namespace) -> int:
             print(f"  {m.get('host')}: {m.get('home')} · last sync {age(time.time() - float(m.get('synced_at', 0)))}")
         n = len(list((store / 'memory').iterdir())) if (store / "memory").is_dir() else 0
         print(f"Projects with shared memory: {n}")
+        waiting = transfer.pending(s) + transfer.pending(s, own=True)
+        print(f"Conversations waiting:       {len(waiting)}" + (" (cas receive --list)" if waiting else ""))
         return 0
 
     store_arg = args.store or s.get("shared_store")
@@ -2248,6 +2478,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="don't ask Claude to continue the agents the last session stopped")
     s.add_argument("claude_args", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_handoff)
+
+    s = sub.add_parser("send", help="put this directory's last conversation in the shared folder, for another machine")
+    s.add_argument("--session", help="conversation id or its start (default: this session, or the latest here)")
+    s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("receive", help="continue here a conversation another machine sent (cas send)")
+    s.add_argument("profile", nargs="?", help="account to run it on (default: the one cas run would pick)")
+    s.add_argument("--session", help="conversation id or its start (default: the one sent for this folder)")
+    s.add_argument("--list", action="store_true", help="show what's waiting in the shared folder")
+    s.add_argument("--discard", action="store_true", help="remove it from the shared folder without resuming it")
+    s.add_argument("-y", "--yes", action="store_true", help="later handoffs without asking")
+    s.add_argument("--no-agents", action="store_true",
+                   help="don't ask Claude to continue the agents the last session stopped")
+    s.add_argument("claude_args", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_receive)
 
     s = sub.add_parser("reset", help="use a limit reset after showing what's left, or record the ones you have")
     s.add_argument("profile", nargs="?")

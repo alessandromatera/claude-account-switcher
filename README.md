@@ -39,6 +39,7 @@ open the login URL in a private window.
 | `cas status` | What's left on every account, and which one to use next |
 | `cas run` | Start Claude Code on the best account (`cas run work` picks one). Other arguments go to `claude` unchanged: `cas run -c`, `cas run work --model opus` |
 | `cas handoff [name]` | Resume this directory's last conversation on another account |
+| `cas send` / `cas receive` | Move a conversation to another machine: `send` where you leave it, `receive` where you continue it (needs `cas share`, see [below](#moving-a-conversation-to-another-machine)) |
 | `cas use work` | Make `work` the current account: a fresh `claude` starts there, on all your machines with `cas share` |
 | `cas reset [name]` | Use a limit reset (see below) |
 | `cas env work` | `eval "$(cas env work)"` makes plain `claude` (or an editor started from that shell) use that account; `cas env` alone gives the current account |
@@ -231,7 +232,43 @@ the current account (when `cas run` or a handoff moves to another account on one
   - Files a cloud client hasn't downloaded yet (`.icloud` placeholders) are skipped until they arrive.
 - **Not shared.** Logins, conversations (transcripts) and `settings.json`, which hold
   machine-specific paths. Log in separately on each machine; copying tokens between machines would
-  make one log the other out when its token refreshes.
+  make one log the other out when its token refreshes. A conversation moves when you ask:
+  `cas send` (next section).
+
+## Moving a conversation to another machine
+
+```sh
+cas send          # on the machine you're leaving: after exiting Claude Code, or `! cas send` inside it
+cas receive       # on the other machine, from any folder: continues it there
+```
+
+`cas send` puts one conversation in the shared folder (`<shared folder>/handoffs/`, one
+compressed archive): its transcript, its agents' transcripts and tool results, its `/rewind`
+checkpoints and its todos. Run inside a session, it sends that session (Claude Code names it in
+`CLAUDE_CODE_SESSION_ID`); then exit it, because what happens there afterwards stays on that
+machine. From a terminal it picks among this folder's recent conversations like `cas handoff`;
+`--session <id>` picks one directly. Running it again replaces what you sent.
+
+`cas receive` on the other machine:
+- **Finds the project.** It looks for the project at the same place relative to `projects_root`
+  (`~/code/X` on both, whatever the user name), as project memory does, and runs there. A project
+  outside `projects_root` needs the same path on both machines; otherwise cas asks to continue it
+  in the current folder.
+- **Rewrites paths.** The old machine's paths in the conversation (project folder and home) become
+  this machine's, so Claude finds the files. File checkpoints keep their content as it was.
+- **Resumes it.** The conversation goes where Claude Code looks for it here, keyed by the resolved
+  project folder (symlinks followed), and cas runs `claude --resume <id>` on the account `cas run`
+  would pick (or `cas receive work`). From then on it behaves like `cas run`: at the limit it
+  offers a handoff. Agents the last session stopped are continued, as after a handoff
+  ([Agents](#agents)); `--no-agents` skips that.
+- **Cleans up.** The archive leaves the shared folder once the conversation is in place. If this
+  machine already had a different copy (say you moved it here before), that copy goes to
+  `~/.claude-accounts/backups/conversations/`.
+
+It waits until the whole archive has synced (the sender records its checksum), and says so while
+it's still arriving. Plain `claude` and `cas run` in a folder a conversation was sent for say so;
+`cas status` counts what's waiting. `cas receive --list` shows it all; `--discard` drops one
+without resuming it (its own machine still has it).
 
 ## Opening 5-hour windows ahead of time
 
@@ -309,7 +346,9 @@ Per profile: `cas set work --label "Work Max" --model sonnet --disable`.
 
 - `cas` relies on Claude Code internals that are not a public API: the Keychain naming per
   `CLAUDE_CONFIG_DIR`, the usage endpoint, the status line's `rate_limits`, `/limit-reset`, and the
-  subagent transcripts (`<session>/subagents/agent-<id>.jsonl` and `.meta.json`). It was
+  subagent transcripts (`<session>/subagents/agent-<id>.jsonl` and `.meta.json`), and, for `cas send`,
+  where a conversation lives (`projects/<resolved folder>/<session>.jsonl`, `file-history/<session>/`)
+  and the `CLAUDE_CODE_SESSION_ID` a session gives its commands. It was
   checked against 2.1.330. If an update changes one of them, `cas` falls back to the remaining
   sources, and `cas doctor` shows what broke.
 - Each account logs in normally from this machine; `cas` doesn't hide or spoof anything. Check that
