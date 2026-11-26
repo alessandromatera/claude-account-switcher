@@ -6,17 +6,20 @@ every other cas command knows this account's live usage for free), remembers the
 (so `cas handoff` can resume it on another account), fetches the other accounts' usage in the
 background when it's out of date (it shows on a later refresh), and prints one line:
 
-    work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 5h 100% · wk 41%
+    work 5h 58% left ↻14:20 · wk 76% ↻Fri 10:00 · ⟲1 │ next: personal 5h 100% · wk 41% ↻Sat 09:00
+
+Every account shows its 5 hours and its week, each with when it resets (a 5-hour window not
+opened yet has no reset: it starts with use).
 
 When no other account has room, it shows the one that frees up first instead of `next:`, also
 at this account's limit:
 
-    work 5h 58% left ↻14:20 · wk 76% │ personal 5h 0% ↻15:10 · wk 41% · ⟲
-    work 5h 8% left ↻14:20 · wk 76% · ⟲1 │ limit reset available: /limit-reset │ personal 5h 0% ↻15:10 · wk 41%
+    work 5h 58% left ↻14:20 · wk 76% ↻Fri 10:00 │ personal 5h 0% ↻15:10 · wk 41% ↻Sat 09:00 · ⟲
+    work 5h 8% left ↻14:20 · wk 76% ↻Fri 10:00 · ⟲1 │ limit reset available: /limit-reset │ personal 5h 0% ↻15:10 · wk 41% ↻Sat 09:00
 
 At the limit it says to hand off, and what's left on the account it hands off to:
 
-    work 5h 7% left ↻14:20 · wk 19% │ limit: exit, then `cas handoff` → personal 5h 100% · wk 41%
+    work 5h 7% left ↻14:20 · wk 19% ↻Fri 10:00 │ limit: exit, then `cas handoff` → personal 5h 100% · wk 41% ↻Sat 09:00
 
 Near the limit, while this conversation's agents are at work, it says so: they stop when the
 account does, so switching once they're done interrupts nothing. At the limit it says how many
@@ -62,28 +65,43 @@ def _left_color(left: float) -> str:
     return "32" if left > 40 else ("33" if left > 15 else "31")
 
 
-def _hm(ts: Optional[float]) -> str:
-    return time.strftime("%H:%M", time.localtime(ts + 30)) if ts else ""  # to the nearest minute
+def _when(ts: float, now: float) -> str:
+    """`14:20` today, `Fri 22:00` later in the week."""
+    from .cli import when  # cli imports this module lazily: no cycle
+
+    return when(ts, now)
 
 
-def _week(e: Any, c: Any) -> Optional[str]:
-    """What's left of the weekly limit: dim, coloured once it runs low."""
+def _low(left: float) -> str:
+    """Dim while there is plenty left, coloured once it runs low."""
+    return _left_color(left) if left <= 40 else "2"
+
+
+def _week(e: Any, now: float, c: Any) -> Optional[str]:
+    """What's left of the weekly limit and when it resets: `wk 41% ↻Fri 22:00`."""
     if e.week_pct is None:
         return None
     wl = max(0.0, 100 - e.week_pct)
-    return c(_left_color(wl) if wl <= 40 else "2", f"wk {wl:.0f}%")
+    return c(_low(wl), f"wk {wl:.0f}%" + (f" ↻{_when(e.week_resets, now)}" if e.week_resets else ""))
 
 
 def _old(sec: float) -> str:
     return f"{int(sec // 60)}m old" if sec < 5400 else f"{int(sec // 3600)}h old"
 
 
-def _room(cfg: Config, e: Any, c: Any) -> str:
-    """What's left on an account with room, after its name: ` 5h 100% · wk 41%`, dim."""
-    out = c("2", " 5h ?" if e.five_pct is None else f" 5h {max(0.0, 100 - e.five_pct):.0f}%")
-    wk = _week(e, c)
+def _room(cfg: Config, e: Any, now: float, c: Any, mark: str = "") -> str:
+    """Another account's 5 hours and week, each with its reset, after its name:
+    ` 5h 100% · wk 41% ↻Fri 22:00`. A 5-hour window not yet opened has no reset: it starts with use."""
+    if e.five_pct is None:
+        out = c("2", " 5h ?")
+    else:
+        left = max(0.0, 100 - e.five_pct)
+        out = c("2", " ") + c(_low(left), f"5h {left:.0f}%" +
+                              (f" ↻{_when(e.five_resets, now)}" if e.five_resets else ""))
+    wk = _week(e, now, c)
     if wk:
         out += c("2", " · ") + wk
+    out += mark
     if e.age is not None and e.age > 2 * float(cfg.settings.get("live_max_age_s", 300)):
         out += c("2", f" ({_old(e.age)})")
     return out
@@ -189,29 +207,13 @@ def _agents(n: int) -> str:
 
 def waiting(cfg: Config, b: picker.Blocked, now: float, c: Any) -> str:
     """The other account when none has room (the one free soonest): what's left and when it frees up."""
-    from .cli import when  # cli imports this module lazily: no cycle
-
-    e = b.eff
-    if e.five_pct is not None and e.five_pct >= float(cfg.settings.get("switch_threshold", 90)):
-        label, pct, at = "5h", e.five_pct, e.five_resets
-    elif e.week_pct is not None and e.week_pct >= float(cfg.settings.get("weekly_threshold", 97)):
-        label, pct, at = "wk", e.week_pct, e.week_resets
-    else:
+    if not picker.exhausted(b.eff, cfg.settings):
         return c("2", f" │ {b.profile.name} {b.reason}")  # not logged in
-    left = max(0.0, 100 - pct)
-    out = c("2", f" │ {b.profile.name} ") + c(_left_color(left), f"{label} {left:.0f}%")
-    if at:
-        out += c("2", f" ↻{when(at, now)}")
-    wk = _week(e, c) if label == "5h" else None  # stopped by the week: that's the figure above
-    if wk:
-        out += c("2", " · ") + wk
     rs = resets.best_status(b.profile, now)
     n = rs.count(now) if rs else None
-    if n or (rs and rs.has_any(now)):
-        out += c("2", " · ") + c("36", f"⟲{n or ''}")  # a reset there would free it now: `cas reset`
-    if e.age is not None and e.age > 2 * float(cfg.settings.get("live_max_age_s", 300)):
-        out += c("2", f" ({_old(e.age)})")
-    return out
+    # a reset there would free it now: `cas reset`
+    mark = c("2", " · ") + c("36", f"⟲{n or ''}") if n or (rs and rs.has_any(now)) else ""
+    return c("2", f" │ {b.profile.name}") + _room(cfg, b.eff, now, c, mark)
 
 
 def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color: bool = True,
@@ -227,9 +229,9 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
         parts.append(c("2", "5h ?"))
     else:
         left = max(0.0, 100 - e.five_pct)
-        txt = f"5h {left:.0f}% left" + (f" ↻{_hm(e.five_resets)}" if e.five_resets else "")
+        txt = f"5h {left:.0f}% left" + (f" ↻{_when(e.five_resets, now)}" if e.five_resets else "")
         parts.append(c(_left_color(left), txt))
-    wk = _week(e, c)
+    wk = _week(e, now, c)
     if wk:
         parts.append(wk)
     rs = resets.best_status(p, now)
@@ -251,7 +253,7 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
             stopped = subagents.cut_off(agents, now - subagents.HANDOFF_WINDOW_S) \
                 if cfg.settings.get("resume_agents", True) else []
             line += " │ " + c("33", f"limit: exit, then `cas handoff` → {alt.profile.name}") + \
-                _room(cfg, alt.eff, c) + \
+                _room(cfg, alt.eff, now, c) + \
                 (c("33", f", which continues the {_agents(len(stopped))}") if stopped else "")
         elif n or (rs and rs.has_any(now)):
             line += " │ " + c("36", "limit reset available: /limit-reset")
@@ -259,16 +261,16 @@ def render(cfg: Config, p: Optional[Profile], now: Optional[float] = None, color
             line += " │ " + c("31", "all accounts at limit")
         else:
             soon = min((x.five_resets for _, x in items if x.five_resets), default=None)
-            line += " │ " + c("31", "all accounts at limit" + (f" · first reset {_hm(soon)}" if soon else ""))
+            line += " │ " + c("31", "all accounts at limit" + (f" · first reset {_when(soon, now)}" if soon else ""))
     elif outside is not None:
         line += " │ " + c("33", f"⚠ opened outside cas, which is on {outside.name} → exit, then: {fix}")
     elif running:
         them = "them" if len(running) != 1 else "it"
         line += " │ " + c("33", f"⚠ {_agents(len(running))} running, limit near" +
                           (f" → let {them} finish, then exit and `cas handoff` → {alt.profile.name}" if alt
-                           else ", no other account has room")) + (_room(cfg, alt.eff, c) if alt else "")
+                           else ", no other account has room")) + (_room(cfg, alt.eff, now, c) if alt else "")
     elif alt:
-        line += c("2", f" │ next: {alt.profile.name}") + _room(cfg, alt.eff, c)
+        line += c("2", f" │ next: {alt.profile.name}") + _room(cfg, alt.eff, now, c)
     line += other
     if keychain_locked:
         line += " │ " + c("31", "⚠ Keychain locked: this login can't renew → security unlock-keychain")

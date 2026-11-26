@@ -70,12 +70,14 @@ class CliTest(IsolatedHome):
     def test_statusline_records_usage_and_session(self):
         p = self.add_profile()
         cfg = Config.load()
+        wk_at = int(time.time()) + 86400
         payload = {"session_id": "sess-1", "workspace": {"current_dir": "/proj"},
                    "rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": int(time.time()) + 3600},
-                                   "seven_day": {"used_percentage": 24, "resets_at": int(time.time()) + 86400}}}
+                                   "seven_day": {"used_percentage": 24, "resets_at": wk_at}}}
         out = statusline.main(json.dumps(payload), cfg, p.env({}))
         self.assertIn("work", out)
         self.assertIn("58% left", out)
+        self.assertIn(f"wk 76% ↻{cli.when(wk_at)}", out)  # this account's week, with its reset
         st = usage.load_state("work")
         self.assertEqual(st["last_session"]["id"], "sess-1")
         self.assertEqual(st["usage"]["five_hour"]["pct"], 42)
@@ -85,7 +87,13 @@ class CliTest(IsolatedHome):
         now = time.time()
         usage.record_snapshot("default", usage.Snapshot(now - 1800, "live", usage.Window(8, now + 3600),
                                                          usage.Window(50, now + 86400), "acct-hub"))
-        self.assertIn("next: default 5h 92% · wk 50% (30m old)", statusline.render(cfg, p, now, color=False))
+        self.assertIn(f"next: default 5h 92% ↻{cli.when(now + 3600, now)} · wk 50% ↻{cli.when(now + 86400, now)}"
+                      " (30m old)", statusline.render(cfg, p, now, color=False))
+        # a 5-hour window not opened yet has no reset time: it starts with use
+        usage.record_snapshot("default", usage.Snapshot(now, "live", usage.Window(0, None),
+                                                         usage.Window(50, now + 86400), "acct-hub"))
+        self.assertIn(f"next: default 5h 100% · wk 50% ↻{cli.when(now + 86400, now)}",
+                      statusline.render(cfg, p, now, color=False))
         # garbage input never raises
         self.assertIn("default", statusline.main("not json", cfg, {}))
 
@@ -107,19 +115,20 @@ class CliTest(IsolatedHome):
         usage.record_snapshot("work", usage.Snapshot(now, "statusline", usage.Window(50, now + 3600),
                                                       usage.Window(40, now + 86400), "acct-work"))
         out = statusline.render(cfg, p, now, color=False)
-        self.assertIn(f"│ default 5h 0% ↻{cli.when(at, now)} · wk 43%", out)  # its week too
+        self.assertIn(f"│ default 5h 0% ↻{cli.when(at, now)} · wk 43% ↻{cli.when(now + 86400, now)}", out)
         self.assertNotIn("next:", out)
         # a reset there would free it now
         resets.record("default", resets.parse_status({"eligible": True, "grants": [
             {"id": "g1", "resets_left": 2, "clears": ["five_hour"], "type": "session"}]}, now))
-        self.assertIn(f"↻{cli.when(at, now)} · wk 43% · ⟲2", statusline.render(cfg, p, now, color=False))
+        self.assertIn(f"wk 43% ↻{cli.when(now + 86400, now)} · ⟲2", statusline.render(cfg, p, now, color=False))
         # stopped by its weekly limit instead
         usage.record_snapshot("default", usage.Snapshot(now + 1, "live", usage.Window(10, at),
                                                          usage.Window(99, now + 4 * 86400), "acct-hub"))
         later = now + 1801  # and that reading stayed old
         out = statusline.render(cfg, p, later, color=False)
-        self.assertIn(f"│ default wk 1% ↻{cli.when(now + 4 * 86400, later)} · ⟲2 (30m old)", out)
-        self.assertEqual(out.count("wk "), 2)  # once for each account: its weekly limit is the figure shown
+        self.assertIn(f"│ default 5h 90% ↻{cli.when(at, later)} · wk 1% ↻{cli.when(now + 4 * 86400, later)}"
+                      " · ⟲2 (30m old)", out)  # its 5 hours too, though the week is what stops it
+        self.assertEqual(out.count("wk "), 2)  # once for each account
 
     def test_statusline_shows_the_other_account_at_the_limit_when_it_has_no_room(self):
         p = self.add_profile()
@@ -493,10 +502,12 @@ class CliTest(IsolatedHome):
                        "rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": int(now) + 3600}}}
             return re.sub(r"\x1b\[[0-9;]*m", "", statusline.main(json.dumps(payload), cfg, p.env({})))
 
+        room = f"5h 90% ↻{cli.when(now + 3600, now)} · wk 70% ↻{cli.when(now + 86400, now)}"
+
         self.assertIn("next: default", line(50))  # far from the limit: no warning
         out = line(80)
         self.assertIn("⚠ 2 agents running, limit near → let them finish, then exit and `cas handoff` → default"
-                      " 5h 90% · wk 70%", out)
+                      f" {room}", out)
         self.assertNotIn("next:", out)
         cfg.settings["agent_warning"] = 0
         self.assertNotIn("agents running", line(80))
@@ -504,11 +515,11 @@ class CliTest(IsolatedHome):
 
         # at the limit the agents stop too; the handoff continues them
         write_agent(t, "a2", AGENT_LIMIT, True, now)
-        self.assertIn("limit: exit, then `cas handoff` → default 5h 90% · wk 70%, which continues the 2 agents",
+        self.assertIn(f"limit: exit, then `cas handoff` → default {room}, which continues the 2 agents",
                       line(100))
         cfg.settings["resume_agents"] = False
         self.assertNotIn("continues", line(100))
-        self.assertIn("limit: exit, then `cas handoff` → default 5h 90% · wk 70%", line(100))
+        self.assertIn(f"limit: exit, then `cas handoff` → default {room}", line(100))
 
     def test_run_loop_reset_path_asks_and_offers_once(self):
         """No other account has room: the user picks the reset; it opens /limit-reset; never offered twice."""

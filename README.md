@@ -67,15 +67,17 @@ than cas's, its status line says so and gives the fix:
 (`claude -c` reopens the same conversation, now on `work`).
 
 **Inside Claude Code:**
-- The status line shows the current account, what's left and when it resets, plus the next account:
-  `work 5h 58% left ↻14:20 · wk 76% · ⟲1 │ next: personal 5h 100% · wk 41%`.
-  When no other account has room, it shows the one that frees up first, with when it resets, its week, and
-  `⟲` if a limit reset could free it now: `│ personal 5h 0% ↻15:10 · wk 41% · ⟲`. It shows that too
-  once this account is at its limit.
+- The status line shows the current account and the next one, each with what's left of its 5 hours
+  and its week and when each resets:
+  `work 5h 58% left ↻14:20 · wk 76% ↻Fri 10:00 · ⟲1 │ next: personal 5h 100% · wk 41% ↻Sat 09:00`.
+  A 5-hour window not opened yet has no reset time: it starts with use.
+  When no other account has room, it shows the one that frees up first, with `⟲` if a limit reset
+  could free it now: `│ personal 5h 0% ↻15:10 · wk 41% ↻Sat 09:00 · ⟲`. It shows that too once this
+  account is at its limit. A figure older than twice `live_max_age_s` says how old it is, e.g. `(11h old)`.
   At the limit it tells you what to do next, with what's left on the account to switch to:
-  `│ limit: exit, then cas handoff → personal 5h 100% · wk 41%`. Near it, while this conversation's
-  agents are at work, it says so:
-  `⚠ 2 agents running, limit near → let them finish, then exit and cas handoff → personal 5h 100% · wk 41%`
+  `│ limit: exit, then cas handoff → personal 5h 100% · wk 41% ↻Sat 09:00`. Near it, while this
+  conversation's agents are at work, it says so:
+  `⚠ 2 agents running, limit near → let them finish, then exit and cas handoff → personal 5h 100% · wk 41% ↻Sat 09:00`
   (see [Agents](#agents)).
 - `/accounts` summarizes all accounts. `! cas status` shows the same table without a model call.
 
@@ -124,7 +126,7 @@ session can't change account, so no handoff can carry a running agent over. What
 - **Warn first.** From `agent_warning` points before `switch_threshold` (default 15, so from 75%
   of the 5-hour window used), the status line warns while agents are at work. Switching once they
   are done interrupts nothing. At the limit it counts the ones that stopped:
-  `limit: exit, then cas handoff → personal 5h 100% · wk 41%, which continues the 2 agents`.
+  `limit: exit, then cas handoff → personal 5h 100% · wk 41% ↻Sat 09:00, which continues the 2 agents`.
 
 ## Logins over SSH (macOS Keychain)
 
