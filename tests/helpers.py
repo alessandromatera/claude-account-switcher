@@ -21,6 +21,15 @@ class IsolatedHome(unittest.TestCase):
         kc = mock.patch("cas.keychain.supported", return_value=False)
         kc.start()
         self.addCleanup(kc.stop)
+        # ...nor the logins in it: the test home's ~/.claude maps to the real "Claude Code-credentials"
+        for name, value in (("keychain_read", None), ("keychain_write", False)):
+            p = mock.patch(f"cas.renew.{name}", return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        # ...and never renew a login for real
+        post = mock.patch("cas.renew._post", return_value=(None, "no network in tests"))
+        post.start()
+        self.addCleanup(post.stop)
         # Never spawn real background usage fetches from the status line.
         bg = mock.patch("cas.statusline.refresh_others")
         bg.start()

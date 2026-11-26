@@ -315,11 +315,17 @@ Freshest source wins, and every number shows its source and age:
 2. **Claude Code's cache**: `cachedUsageUtilization` and `unusedLimitResetStatusCache` in each
    profile's `.claude.json`.
 3. **live**: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, the endpoint `/usage`
-   uses, called with that profile's own OAuth token. The token is read from the Keychain at call
-   time, sent only to api.anthropic.com, and never printed or stored. It runs when cached data is
-   older than `live_max_age_s`, including in the background each time `cas run` or `claude` starts
-   a session, so the status line's `next:` is current; set `live_usage` to `never` to turn it off. Expired tokens are not
-   refreshed by `cas`; Claude Code refreshes them the next time it runs on that account.
+   uses, called with that profile's own OAuth token. The token is read from where Claude Code keeps
+   it (Keychain or `.credentials.json`) at call time, sent only to api.anthropic.com, and never
+   printed. It runs when cached data is older than `live_max_age_s`, including in the background
+   each time `cas run` or `claude` starts a session and during it, so the status line's figures for
+   the other accounts are current; set `live_usage` to `never` to turn it off.
+   A token lasts about 8 hours. When an idle account's has expired, cas renews it the way Claude
+   Code does (the login's refresh token, sent to platform.claude.com) and saves the result where
+   Claude Code keeps the login. Renewing replaces the refresh token, so cas does it only while no
+   Claude Code session runs on that account, holding Claude Code's own lock for saving a login;
+   each renewal goes in `~/.claude-accounts/logs/renew.log`. `renew_logins: false` leaves it to
+   Claude Code, the next time it runs on that account.
 
 A window whose reset time has passed counts as 0% used, so an account idle for 5+ hours shows as
 fresh. One limit: usage on claude.ai or the desktop app shares the same quota, and only appears once
@@ -338,6 +344,7 @@ one of these sources refreshes.
 | `resume_agents` | true | a handoff asks Claude to continue the agents the last session stopped |
 | `agent_warning` | 15 | the status line warns about running agents this many points before `switch_threshold` (0 = never) |
 | `live_usage` | `auto` | `auto`, `always` or `never` |
+| `renew_logins` | true | renew an idle account's expired login, so its usage stays current |
 | `prime_model` | `haiku` | model for window-opening pings |
 | `prime_others_on_start` | true | `cas run` opens the other accounts' windows in the background |
 | `shared_store` | none | folder shared with your other Macs (`cas share`) |

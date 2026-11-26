@@ -141,7 +141,7 @@ def check(profile: Profile) -> Optional[Login]:
 
 
 @contextmanager
-def _claude_store_lock(config_dir: Path) -> Iterator[bool]:
+def claude_store_lock(config_dir: Path) -> Iterator[bool]:
     """Take Claude Code's own credential-store lock, so it can't save a renewed login meanwhile.
     Yields False when it's held (Claude Code is saving right now) or can't be taken."""
     lock = config_dir / CLAUDE_STORE_LOCK
@@ -167,7 +167,7 @@ def settle(profile: Profile) -> Tuple[Optional[Login], List[str]]:
     login = check(profile)
     if login is None or not login.stale_keychain_copy:
         return login, []
-    with _claude_store_lock(profile.dir) as held:
+    with claude_store_lock(profile.dir) as held:
         if not held:
             return login, []
         again = check(profile)

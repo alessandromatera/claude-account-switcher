@@ -5,8 +5,8 @@ Sources, freshest wins:
               every refresh; `cas statusline` records them for the profile it runs under.
   claude      Claude Code caches the /api/oauth/usage response as `cachedUsageUtilization`
               in each config dir's .claude.json.
-  live        cas calls GET /api/oauth/usage itself with the profile's OAuth token (read-only;
-              the token is read from the keychain and never printed or stored).
+  live        cas calls GET /api/oauth/usage itself with the profile's OAuth token (read from
+              where Claude Code keeps it, never printed; an expired one is renewed: renew.py).
   ping        after a priming ping, cas records that a window just opened.
 
 A window whose reset time has passed is treated as reset (0%), so an account idle for
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -25,8 +24,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from . import __version__
-from .config import Profile, keychain_account, read_json, state_dir, write_json_atomic
+from . import __version__, renew
+from .config import Profile, read_json, state_dir, write_json_atomic
 
 FIVE_HOURS = 5 * 3600
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -293,35 +292,14 @@ def effective(snap: Optional[Snapshot], now: Optional[float] = None) -> Effectiv
 # --------------------------------------------------------------------------- live fetch
 
 def read_oauth(profile: Profile) -> Optional[Dict[str, Any]]:
-    """The profile's claudeAiOauth credentials, or None. Never logged or persisted by cas."""
-    raw = None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-a", keychain_account(), "-w", "-s", profile.keychain_service],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode == 0:
-            raw = r.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        raw = None
-    data = None
-    if raw:
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            try:  # stored hex-encoded
-                data = json.loads(bytes.fromhex(raw).decode("utf-8"))
-            except ValueError:
-                data = None
-    if data is None:  # plaintext fallback Claude Code uses when no keychain is available
-        data = read_json(profile.dir / ".credentials.json", None)
-    if not isinstance(data, dict):
-        return None
-    oauth = data.get("claudeAiOauth")
+    """The profile's claudeAiOauth credentials, or None. Never logged by cas."""
+    _, data = renew.read_store(profile)
+    oauth = (data or {}).get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
 
 
-def fetch_live(profile: Profile, timeout: float = 8.0) -> Tuple[Optional[Snapshot], Optional[str]]:
+def fetch_live(profile: Profile, timeout: float = 8.0, renew_login: bool = True
+               ) -> Tuple[Optional[Snapshot], Optional[str]]:
     oauth = read_oauth(profile)
     if not oauth or not oauth.get("accessToken"):
         from . import keychain
@@ -332,7 +310,11 @@ def fetch_live(profile: Profile, timeout: float = 8.0) -> Tuple[Optional[Snapsho
         return None, "not logged in"
     exp = parse_time(oauth.get("expiresAt"))
     if exp is not None and exp < time.time() + 60:
-        return None, "token expired (Claude Code refreshes it next time it runs on this account)"
+        if not renew_login:
+            return None, "token expired (Claude Code renews it next time it runs on this account; renew_logins)"
+        oauth, why = renew.renew(profile)
+        if oauth is None:
+            return None, f"token expired, not renewed: {why}"
     headers = {
         "Authorization": f"Bearer {oauth['accessToken']}",
         "anthropic-beta": "oauth-2025-04-20",
@@ -391,5 +373,5 @@ def refresh(profile: Profile, settings: Dict[str, Any], live: Optional[bool] = N
         live = live_due(snap, settings)
     if not live or not profile.logged_in():
         return snap, None
-    fresh, err = fetch_live(profile)
+    fresh, err = fetch_live(profile, renew_login=bool(settings.get("renew_logins", True)))
     return (fresh or snap), err

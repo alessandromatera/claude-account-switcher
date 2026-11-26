@@ -49,6 +49,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # "auto" = only when cached data is older than live_max_age_s, "always", or "never".
     "live_usage": "auto",
     "live_max_age_s": 300,
+    # When an idle account's login has expired (after ~8 h), renew it as Claude Code would, so its
+    # usage stays current. Only while no Claude Code session runs on that account.
+    "renew_logins": True,
     # What `cas run` does when Claude exits because the account hit its limit:
     # "ask" = offer to resume the conversation on the next account, "auto" = just do it, "off".
     "handoff": "ask",
